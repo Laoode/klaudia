@@ -5,45 +5,48 @@ from typing import Any
 from langchain_core.tools import BaseTool, StructuredTool
 from mcp import ClientSession
 from mcp.client.sse import sse_client
-from pydantic import Field, create_model
 
 logger = logging.getLogger(__name__)
 
 
-_JSON_TYPE_MAP: dict[str, type] = {
-    "string": str,
-    "integer": int,
-    "number": float,
-    "boolean": bool,
-    "array": list,
-    "object": dict,
-}
+_ANY_ITEM_SCHEMA: dict[str, Any] = {"type": "string"}
 
 
-def _args_model(tool_name: str, schema: dict[str, Any]) -> type:
-    """Build a Pydantic model from an MCP tool's JSON input schema.
+def _normalize_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Return a JSON schema that Gemini's function-declaration parser accepts.
 
-    Without this, StructuredTool.from_function(**kwargs) yields a schema with a single
-    `kwargs` field — LLM tool calls then land inside `{"kwargs": {...}}` and MCP rejects.
+    Gemini (via langchain-google-genai) requires every `type: array` to carry a
+    non-empty `items` schema. FastMCP emits `items: {}` for `list[Any]`, and
+    langchain-google-genai drops empty dicts (see `_dict_to_genai_schema`
+    truthiness check). We replace missing/empty `items` with a permissive
+    `{"type": "string"}` so tools like `tool_append_rows(data: list[list[Any]])`
+    survive the Gemini round-trip.
     """
-    props: dict[str, Any] = schema.get("properties", {}) or {}
-    required = set(schema.get("required", []) or [])
-    fields: dict[str, tuple[type, Any]] = {}
-    for name, prop in props.items():
-        py_type: type = dict  # safe fallback
-        if "type" in prop:
-            py_type = _JSON_TYPE_MAP.get(prop["type"], dict)
-        elif "anyOf" in prop:
-            for entry in prop["anyOf"]:
-                t = _JSON_TYPE_MAP.get(entry.get("type", ""))
-                if t and t is not type(None):
-                    py_type = t
-                    break
-        default = ... if name in required else prop.get("default", None)
-        if name not in required:
-            py_type = py_type | None  # type: ignore[operator]
-        fields[name] = (py_type, Field(default, description=prop.get("description", "")))
-    return create_model(f"{tool_name}_Args", **fields)
+    if not isinstance(schema, dict):
+        return schema
+
+    out = dict(schema)
+    if out.get("type") == "array":
+        items = out.get("items")
+        if not isinstance(items, dict) or not items:
+            out["items"] = dict(_ANY_ITEM_SCHEMA)
+
+    for key in ("items", "additionalProperties"):
+        value = out.get(key)
+        if isinstance(value, dict):
+            out[key] = _normalize_schema(value)
+
+    for key in ("properties", "definitions", "$defs"):
+        nested = out.get(key)
+        if isinstance(nested, dict):
+            out[key] = {k: _normalize_schema(v) for k, v in nested.items()}
+
+    for key in ("anyOf", "oneOf", "allOf"):
+        values = out.get(key)
+        if isinstance(values, list):
+            out[key] = [_normalize_schema(v) for v in values]
+
+    return out
 
 
 class MCPToolRegistry:
@@ -98,7 +101,9 @@ class MCPToolRegistry:
         session = self._session
         tool_name = tool_info.name
         input_schema = getattr(tool_info, "inputSchema", None) or {}
-        args_schema = _args_model(tool_name, input_schema)
+        # Pass the MCP JSON schema directly — langchain ArgsSchema accepts dict.
+        # This preserves nested `items` that Pydantic drops for bare `list`.
+        args_schema = _normalize_schema(input_schema)
 
         async def _call(**kwargs: Any) -> str:
             # Strip None values so MCP tools see only explicit args.

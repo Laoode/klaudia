@@ -2,7 +2,7 @@ import logging
 from typing import Any
 
 from langchain_core.messages import AIMessage
-from langchain_openai import ChatOpenAI
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import StateGraph, START
 
 from klaudia.core.supervisor.agents.data_entry_team.agents import make_data_entry_team_node
@@ -20,16 +20,14 @@ class SupervisorAgent:
 
     def __init__(
         self,
-        llm_endpoint: str,
         llm_api_key: str,
         llm_model: str,
         mcp_sqlite: MCPToolRegistry,
         mcp_gsheets: MCPToolRegistry,
     ) -> None:
-        self._llm = ChatOpenAI(
+        self._llm = ChatGoogleGenerativeAI(
             model=llm_model,
-            base_url=llm_endpoint,
-            api_key=llm_api_key,
+            google_api_key=llm_api_key,
             temperature=0.5,
         )
         self._mcp_sqlite = mcp_sqlite
@@ -71,7 +69,8 @@ class SupervisorAgent:
                 if isinstance(msg, AIMessage):
                     final_msg = msg
                     break
-        content = final_msg.content if hasattr(final_msg, "content") else str(final_msg)
+        raw = final_msg.content if hasattr(final_msg, "content") else str(final_msg)
+        content = raw if isinstance(raw, str) else str(raw)
 
         # Collect tools used from message names
         tools_used = []

@@ -14,6 +14,10 @@ from klaudia.core.supervisor.tools.wrappers import get_sql_tools
 logger = logging.getLogger(__name__)
 
 
+def _text(content: str | list) -> str:
+    return content if isinstance(content, str) else str(content)
+
+
 def make_sql_agent_node(llm: BaseChatModel, mcp_sqlite: MCPToolRegistry):
     """Create an SQL agent node for the supervisor graph."""
     tools = get_sql_tools(mcp_sqlite)
@@ -25,7 +29,7 @@ def make_sql_agent_node(llm: BaseChatModel, mcp_sqlite: MCPToolRegistry):
             update={
                 "messages": [
                     HumanMessage(
-                        content=result["messages"][-1].content,
+                        content=_text(result["messages"][-1].content),
                         name="sql_agent",
                     )
                 ]

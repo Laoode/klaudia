@@ -24,6 +24,10 @@ from klaudia.interfaces.tool_registry import MCPToolRegistry
 
 logger = logging.getLogger(__name__)
 
+
+def _text(content: str | list) -> str:
+    return content if isinstance(content, str) else str(content)
+
 MEMBERS = ["read_agent", "sheet_agent", "write_agent"]
 
 VALID_ROUTES = {*MEMBERS, "FINISH"}
@@ -60,21 +64,21 @@ def make_data_entry_team(llm: BaseChatModel, mcp_gsheets: MCPToolRegistry):
     async def read_node(state: SupervisorState) -> Command[Literal["supervisor"]]:
         result = await read_agent.ainvoke(state)
         return Command(
-            update={"messages": [HumanMessage(content=result["messages"][-1].content, name="read_agent")]},
+            update={"messages": [HumanMessage(content=_text(result["messages"][-1].content), name="read_agent")]},
             goto="supervisor",
         )
 
     async def sheet_node(state: SupervisorState) -> Command[Literal["supervisor"]]:
         result = await sheet_agent.ainvoke(state)
         return Command(
-            update={"messages": [HumanMessage(content=result["messages"][-1].content, name="sheet_agent")]},
+            update={"messages": [HumanMessage(content=_text(result["messages"][-1].content), name="sheet_agent")]},
             goto="supervisor",
         )
 
     async def write_node(state: SupervisorState) -> Command[Literal["supervisor"]]:
         result = await write_agent.ainvoke(state)
         return Command(
-            update={"messages": [HumanMessage(content=result["messages"][-1].content, name="write_agent")]},
+            update={"messages": [HumanMessage(content=_text(result["messages"][-1].content), name="write_agent")]},
             goto="supervisor",
         )
 
@@ -110,7 +114,7 @@ def make_data_entry_team_node(llm: BaseChatModel, mcp_gsheets: MCPToolRegistry):
             update={
                 "messages": [
                     HumanMessage(
-                        content=response["messages"][-1].content,
+                        content=_text(response["messages"][-1].content),
                         name="data_entry_team",
                     )
                 ]
