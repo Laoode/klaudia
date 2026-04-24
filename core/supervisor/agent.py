@@ -1,5 +1,5 @@
 import logging
-from typing import Any
+from typing import Any, AsyncIterator
 
 from langchain_core.messages import AIMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -86,3 +86,73 @@ class SupervisorAgent:
             tools_called=tools_used,
             metadata={"routed_to": routed_to},
         )
+
+    async def stream_conversation(
+        self,
+        messages: list[dict[str, Any]],
+        extraction_data: dict[str, Any] | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Stream the supervisor graph as structured events.
+
+        Event shape: {"type": <name>, "data": <payload>}
+        Types emitted:
+          - step:  graph node transition (node, next)
+          - token: final-answer token (only tag="final_answer")
+          - tool:  tool invocation observed in node output
+          - final: end-of-stream aggregate (content, tools_called, metadata)
+        """
+        state = {
+            "messages": messages,
+            "extraction_data": extraction_data,
+        }
+
+        final_chunks: list[str] = []
+        tools_used: list[str] = []
+        routed_to = "FINISH"
+        final_message_content: str | None = None
+
+        async for mode, payload in self._graph.astream(
+            state,
+            config={"recursion_limit": 50},
+            stream_mode=["messages", "updates"],
+        ):
+            if mode == "messages":
+                msg_chunk, metadata = payload
+                tags = metadata.get("tags", []) or []
+                if "nostream" in tags or "final_answer" not in tags:
+                    continue
+                text = getattr(msg_chunk, "content", "")
+                if isinstance(text, str) and text:
+                    final_chunks.append(text)
+                    yield {"type": "token", "data": {"text": text}}
+                continue
+
+            if mode == "updates":
+                for node, update in payload.items():
+                    if not isinstance(update, dict):
+                        continue
+                    nxt = update.get("next")
+                    if nxt is not None:
+                        routed_to = nxt
+                    yield {"type": "step", "data": {"node": node, "next": nxt}}
+                    for msg in update.get("messages", []) or []:
+                        name = getattr(msg, "name", None)
+                        if name and name not in ("user", "system"):
+                            tools_used.append(name)
+                            yield {"type": "tool", "data": {"name": name}}
+                        if isinstance(msg, AIMessage) and node == "supervisor":
+                            raw = msg.content if isinstance(msg.content, str) else str(msg.content)
+                            final_message_content = raw
+
+        # Fallback to supervisor's final AIMessage if token-level streaming
+        # didn't flow through callbacks (provider-dependent).
+        content = "".join(final_chunks) or (final_message_content or "")
+
+        yield {
+            "type": "final",
+            "data": {
+                "content": content,
+                "tools_called": tools_used,
+                "metadata": {"routed_to": routed_to},
+            },
+        }

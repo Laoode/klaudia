@@ -29,13 +29,15 @@ def make_supervisor_node(llm: BaseChatModel):
             {"role": "system", "content": SUPERVISOR_ROUTING_PROMPT},
         ] + state["messages"]
 
-        response = llm.with_structured_output(Router).invoke(messages)
+        router_llm = llm.with_structured_output(Router).with_config({"tags": ["nostream"]})
+        response = router_llm.invoke(messages)
         goto = response["next"]
 
         # Treat any value not in MEMBERS as FINISH (LLM sometimes returns conversational text)
         if goto not in MEMBERS:
             logger.info(f"Supervisor routing to FINISH (raw: {goto!r})")
-            reply = llm.invoke(state["messages"])
+            final_llm = llm.with_config({"tags": ["final_answer"]})
+            reply = final_llm.invoke(state["messages"])
             return Command(goto=END, update={"messages": [reply], "next": "FINISH"})
 
         logger.info(f"Supervisor routing to: {goto}")
