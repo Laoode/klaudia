@@ -1,5 +1,5 @@
 import logging
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Optional
 
 from langchain_core.messages import AIMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -24,6 +24,7 @@ class SupervisorAgent:
         llm_model: str,
         mcp_sqlite: MCPToolRegistry,
         mcp_gsheets: MCPToolRegistry,
+        langfuse: Optional[Any] = None,
     ) -> None:
         self._llm = ChatGoogleGenerativeAI(
             model=llm_model,
@@ -32,7 +33,27 @@ class SupervisorAgent:
         )
         self._mcp_sqlite = mcp_sqlite
         self._mcp_gsheets = mcp_gsheets
+        self._langfuse = langfuse
         self._graph = self._build_graph()
+
+    def _graph_config(
+        self,
+        session_id: Optional[int],
+        user_id: Optional[int],
+        run_name: str,
+    ) -> dict[str, Any]:
+        """Base RunnableConfig + optional Langfuse callback + trace metadata."""
+        config: dict[str, Any] = {"recursion_limit": 50}
+        if self._langfuse is not None:
+            lf_cfg = self._langfuse.langchain_config(
+                session_id=session_id,
+                user_id=user_id,
+                run_name=run_name,
+                tags=["klaudia", "supervisor"],
+            )
+            # Merge (callbacks + metadata + run_name) without clobbering recursion_limit
+            config.update(lf_cfg)
+        return config
 
     def _build_graph(self):
         """Build the LangGraph supervisor graph."""
@@ -52,6 +73,8 @@ class SupervisorAgent:
         self,
         messages: list[dict[str, Any]],
         extraction_data: dict[str, Any] | None = None,
+        session_id: int | None = None,
+        user_id: int | None = None,
     ) -> AgentResponse:
         """Run the supervisor graph on the given messages."""
         state = {
@@ -59,7 +82,8 @@ class SupervisorAgent:
             "extraction_data": extraction_data,
         }
 
-        result = await self._graph.ainvoke(state, {"recursion_limit": 50})
+        config = self._graph_config(session_id, user_id, run_name="klaudia.supervisor.invoke")
+        result = await self._graph.ainvoke(state, config)
 
         # Extract final AI message (skip human/system messages)
         final_msg = result["messages"][-1]
@@ -91,6 +115,8 @@ class SupervisorAgent:
         self,
         messages: list[dict[str, Any]],
         extraction_data: dict[str, Any] | None = None,
+        session_id: int | None = None,
+        user_id: int | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """Stream the supervisor graph as structured events.
 
@@ -111,9 +137,11 @@ class SupervisorAgent:
         routed_to = "FINISH"
         final_message_content: str | None = None
 
+        stream_config = self._graph_config(session_id, user_id, run_name="klaudia.supervisor.stream")
+
         async for mode, payload in self._graph.astream(
             state,
-            config={"recursion_limit": 50},
+            config=stream_config,
             stream_mode=["messages", "updates"],
         ):
             if mode == "messages":
