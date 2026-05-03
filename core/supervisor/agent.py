@@ -5,6 +5,7 @@ from langchain_core.messages import AIMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import StateGraph, START
 
+from klaudia.core.supervisor._content import coerce_to_text, strip_internal_markers
 from klaudia.core.supervisor.agents.data_entry_team.agents import make_data_entry_team_node
 from klaudia.core.supervisor.agents.sql_agent.agent import make_sql_agent_node
 from klaudia.core.supervisor.router import make_supervisor_node
@@ -13,6 +14,46 @@ from klaudia.interfaces.tool_registry import MCPToolRegistry
 from klaudia.models.message import AgentResponse
 
 logger = logging.getLogger(__name__)
+
+# Names of sub-agent / team nodes whose final message can serve as a fallback
+# when the supervisor's own final reply is empty.
+_FALLBACK_NAMES = ("data_entry_team", "sql_agent", "read_agent", "sheet_agent", "write_agent")
+
+
+def _resolve_final_content(messages: list[Any]) -> str:
+    """Pick the user-facing reply for THIS turn.
+
+    Strategy (turn-scoped — must NOT leak earlier turns):
+    1. If the LAST message is an AIMessage with content, that's the supervisor's
+       fresh reply — return it.
+    2. Otherwise fall back to the most recent named-worker message (its
+       confirmation text with internal markers stripped). The worker's reply
+       was generated this turn; it is safe to surface.
+    3. Otherwise empty.
+
+    IMPORTANT: We deliberately do NOT walk past a non-AI tail to find an
+    earlier AIMessage. In a multi-turn conversation the message list contains
+    previous assistant replies (from DB history); returning one of those would
+    make the assistant repeat itself when the current turn produced an empty
+    reply (e.g. Gemini emits a signature-only chunk). The empty reply must
+    instead degrade gracefully to the worker's confirmation.
+    """
+    if not messages:
+        return ""
+
+    last = messages[-1]
+    if isinstance(last, AIMessage):
+        text = coerce_to_text(last.content)
+        if text:
+            return text
+
+    for msg in reversed(messages):
+        if getattr(msg, "name", None) in _FALLBACK_NAMES:
+            text = strip_internal_markers(coerce_to_text(getattr(msg, "content", "")))
+            if text:
+                return text
+
+    return ""
 
 
 class SupervisorAgent:
@@ -85,16 +126,9 @@ class SupervisorAgent:
         config = self._graph_config(session_id, user_id, run_name="klaudia.supervisor.invoke")
         result = await self._graph.ainvoke(state, config)
 
-        # Extract final AI message (skip human/system messages)
-        final_msg = result["messages"][-1]
-        if not isinstance(final_msg, AIMessage):
-            logger.warning(f"Last message is {type(final_msg).__name__}, searching for last AIMessage")
-            for msg in reversed(result["messages"]):
-                if isinstance(msg, AIMessage):
-                    final_msg = msg
-                    break
-        raw = final_msg.content if hasattr(final_msg, "content") else str(final_msg)
-        content = raw if isinstance(raw, str) else str(raw)
+        content = _resolve_final_content(result["messages"])
+        if not content:
+            logger.warning("Supervisor produced no user-facing content; falling back to empty string")
 
         # Collect tools used from message names
         tools_used = []
@@ -135,7 +169,7 @@ class SupervisorAgent:
         final_chunks: list[str] = []
         tools_used: list[str] = []
         routed_to = "FINISH"
-        final_message_content: str | None = None
+        observed_messages: list[Any] = []
 
         stream_config = self._graph_config(session_id, user_id, run_name="klaudia.supervisor.stream")
 
@@ -164,17 +198,17 @@ class SupervisorAgent:
                         routed_to = nxt
                     yield {"type": "step", "data": {"node": node, "next": nxt}}
                     for msg in update.get("messages", []) or []:
+                        observed_messages.append(msg)
                         name = getattr(msg, "name", None)
                         if name and name not in ("user", "system"):
                             tools_used.append(name)
                             yield {"type": "tool", "data": {"name": name}}
-                        if isinstance(msg, AIMessage) and node == "supervisor":
-                            raw = msg.content if isinstance(msg.content, str) else str(msg.content)
-                            final_message_content = raw
 
-        # Fallback to supervisor's final AIMessage if token-level streaming
-        # didn't flow through callbacks (provider-dependent).
-        content = "".join(final_chunks) or (final_message_content or "")
+        # Streamed tokens take precedence; fall back to whatever message
+        # content we observed if no token-level callbacks fired (provider-
+        # dependent) or if Gemini emitted an empty AIMessage at FINISH.
+        streamed = "".join(final_chunks).strip()
+        content = streamed or _resolve_final_content(observed_messages)
 
         yield {
             "type": "final",

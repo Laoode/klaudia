@@ -50,8 +50,19 @@ def get_sheet_tools(registry: MCPToolRegistry) -> list[BaseTool]:
 
 
 def get_write_tools(registry: MCPToolRegistry) -> list[BaseTool]:
-    """Get write tools for Write Agent."""
+    """Get tools for the Write Agent.
+
+    Includes a small set of read tools because compound write flows in the
+    WRITE_AGENT_PROMPT (Pattern B dedup, Pattern D add-column, sheet-name
+    resolution) explicitly require reading before writing. Without these the
+    agent emits [CLARIFY] instead of executing — see incident 2026-04-25
+    where the agent asked the user for a column letter it could have read.
+    """
     allowed = {
+        # Read primitives needed to ground writes in actual sheet state.
+        "tool_get_sheet_data",
+        "tool_list_sheets",
+        # Write primitives.
         "tool_update_cells",
         "tool_batch_update_cells",
         "tool_append_rows",

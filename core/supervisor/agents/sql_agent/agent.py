@@ -6,16 +6,13 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langgraph.prebuilt import create_react_agent
 from langgraph.types import Command
 
+from klaudia.core.supervisor._content import coerce_to_text
 from klaudia.core.supervisor.agents.sql_agent.prompts import SQL_AGENT_PROMPT
 from klaudia.core.supervisor.state import SupervisorState
 from klaudia.interfaces.tool_registry import MCPToolRegistry
 from klaudia.core.supervisor.tools.wrappers import get_sql_tools
 
 logger = logging.getLogger(__name__)
-
-
-def _text(content: str | list) -> str:
-    return content if isinstance(content, str) else str(content)
 
 
 def make_sql_agent_node(llm: BaseChatModel, mcp_sqlite: MCPToolRegistry):
@@ -29,7 +26,7 @@ def make_sql_agent_node(llm: BaseChatModel, mcp_sqlite: MCPToolRegistry):
             update={
                 "messages": [
                     HumanMessage(
-                        content=_text(result["messages"][-1].content),
+                        content=coerce_to_text(result["messages"][-1].content),
                         name="sql_agent",
                     )
                 ]
