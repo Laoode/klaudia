@@ -2,12 +2,12 @@ import logging
 from typing import Any, AsyncIterator, Optional
 
 from langchain_core.messages import AIMessage
-from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import StateGraph, START
 
 from klaudia.core.supervisor._content import coerce_to_text, strip_internal_markers
 from klaudia.core.supervisor.agents.data_entry_team.agents import make_data_entry_team_node
 from klaudia.core.supervisor.agents.sql_agent.agent import make_sql_agent_node
+from klaudia.core.supervisor.llm import build_chat_llm
 from klaudia.core.supervisor.router import make_supervisor_node
 from klaudia.core.supervisor.state import SupervisorState
 from klaudia.interfaces.tool_registry import MCPToolRegistry
@@ -66,11 +66,18 @@ class SupervisorAgent:
         mcp_sqlite: MCPToolRegistry,
         mcp_gsheets: MCPToolRegistry,
         langfuse: Optional[Any] = None,
+        use_vertexai: bool = False,
+        google_cloud_project: str = "",
+        google_cloud_location: str = "global",
+        temperature: float = 0.5,
     ) -> None:
-        self._llm = ChatGoogleGenerativeAI(
+        self._llm = build_chat_llm(
             model=llm_model,
-            google_api_key=llm_api_key,
-            temperature=0.5,
+            temperature=temperature,
+            use_vertexai=use_vertexai,
+            llm_api_key=llm_api_key,
+            google_cloud_project=google_cloud_project,
+            google_cloud_location=google_cloud_location,
         )
         self._mcp_sqlite = mcp_sqlite
         self._mcp_gsheets = mcp_gsheets
