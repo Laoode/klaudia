@@ -21,6 +21,16 @@ OPTIONS = ["FINISH"] + MEMBERS
 # they are unwrapped inside the data_entry_team subgraph.)
 _WORKER_NAMES = ("data_entry_team", "sql_agent")
 
+# Minimal thinking config for latency-critical paths (routing + final reply).
+# These calls don't need deep reasoning — routing is classification, final reply
+# is light summarization. Default thinking level on gemini-3-* is "high", which
+# generates ~1000 internal tokens and adds 7-10s for no visible quality gain here.
+#
+# Applied via .bind() so it only affects these specific calls, not the workers
+# (write_agent benefits from reasoning through composition patterns).
+_MINIMAL_THINK: dict[str, Any] = {
+    "generation_config": {"thinking_config": {"thinking_level": "minimal"}}
+}
 
 _FINAL_REPLY_INSTRUCTION = (
     "You are now writing the user-facing reply as Klaudia. The previous "
@@ -60,47 +70,68 @@ def _prepare_finish_messages(state_messages: list[Any]) -> list[Any]:
     return cleaned
 
 
-class Router(TypedDict):
-    """Worker to route to next. Must be one of: FINISH, sql_agent, data_entry_team."""
-
+class RouterWithResponse(TypedDict):
+    """Combined routing + response for initial FINISH decisions.
+ 
+    When `next` is FINISH and no worker has run yet, `response` contains the
+    user-facing reply — skipping the second _emit_final_reply LLM call.
+    When routing to a worker, `response` must be "".
+    """
     next: Literal["FINISH", "sql_agent", "data_entry_team"]
+    response: str
 
 
 def make_supervisor_node(llm: BaseChatModel):
     """Create a supervisor node that routes between sub-agents."""
 
-    def _emit_final_reply(state_messages: list[Any]) -> Command:
-        final_llm = llm.with_config({"tags": ["final_answer"]})
-        reply = final_llm.invoke(_prepare_finish_messages(state_messages))
+    async def _emit_final_reply(state_messages: list[Any]) -> Command:
+        # Fix: bind minimal thinking — this call is pure summarization,
+        # not reasoning. Reduces 7-10s thinking overhead to ~1-2s.
+        final_llm = (
+            llm
+            .bind(**_MINIMAL_THINK)
+            .with_config({"tags": ["final_answer"]})
+        )
+        reply = await final_llm.ainvoke(_prepare_finish_messages(state_messages))
         return Command(goto=END, update={"messages": [reply], "next": "FINISH"})
 
-    def supervisor_node(state: SupervisorState) -> Command[Literal["sql_agent", "data_entry_team", "__end__"]]:
+    async def supervisor_node(state: SupervisorState) -> Command[...]:
         state_messages = state["messages"]
 
-        # Deterministic FINISH gate: if the latest message comes from a top-
-        # level worker (data_entry_team / sql_agent), the work for this user
-        # turn is done. Skip the router LLM call and go straight to the
-        # summarization step. Prevents loops where the router LLM might
-        # re-route to the same worker, and removes one LLM hop from the path.
+        # Deterministic FINISH gate — worker just reported, skip router call.
         if state_messages:
             last = state_messages[-1]
             last_name = getattr(last, "name", None)
             if last_name in _WORKER_NAMES:
                 logger.info(f"Supervisor: deterministic FINISH (worker reply from {last_name})")
-                return _emit_final_reply(state_messages)
+                return await _emit_final_reply(state_messages)
 
+        # Combined routing + response call — one LLM hop instead of two for FINISH path
+        # Fix: bind minimal thinking for routing (classification task, ~100 tokens output).
         messages = [
             {"role": "system", "content": SUPERVISOR_ROUTING_PROMPT},
         ] + state_messages
 
-        router_llm = llm.with_structured_output(Router).with_config({"tags": ["nostream"]})
-        response = router_llm.invoke(messages)
-        goto = response["next"]
+        combined_llm = (
+            llm
+            .bind(**_MINIMAL_THINK)
+            .with_structured_output(RouterWithResponse)
+            .with_config({"tags": ["nostream"]})
+        )
+        result = await combined_llm.ainvoke(messages)
+        goto = result.get("next", "FINISH")
+        inline_response = (result.get("response") or "").strip()
 
-        # Treat any value not in MEMBERS as FINISH (LLM sometimes returns conversational text)
         if goto not in MEMBERS:
-            logger.info(f"Supervisor routing to FINISH (raw: {goto!r})")
-            return _emit_final_reply(state_messages)
+            if inline_response:
+                from langchain_core.messages import AIMessage
+                logger.info(f"Supervisor: FINISH with inline response ({len(inline_response)} chars)")
+                return Command(
+                    goto=END,
+                    update={"messages": [AIMessage(content=inline_response)], "next": "FINISH"},
+                )
+            logger.info(f"Supervisor routing to FINISH (raw: {goto!r}), generating reply")
+            return await _emit_final_reply(state_messages)
 
         logger.info(f"Supervisor routing to: {goto}")
         return Command(goto=goto, update={"next": goto})

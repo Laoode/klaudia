@@ -1,4 +1,6 @@
+import json
 import logging
+import time
 from typing import Any, AsyncIterator, Optional
 
 from langchain_core.messages import AIMessage
@@ -55,6 +57,59 @@ def _resolve_final_content(messages: list[Any]) -> str:
 
     return ""
 
+def _parse_tool_json_output(raw: Any) -> list[dict]:
+    """Parse MCP tool_list_sheets output into a list of sheet dicts.
+ 
+    The MCP server serialises each sheet as a separate JSON object and
+    concatenates them with spaces/newlines — NOT as a JSON array:
+        {"title": "Sari Laut", ...} {"title": "Indomaret", ...}
+ 
+    json.loads() fails with "Extra data" on this format. We walk through the
+    string with JSONDecoder.raw_decode() to extract objects one by one.
+    Handles all three variants:
+        - Already a Python list  → return as-is
+        - Proper JSON array      → json.loads
+        - Concatenated objects   → iterative raw_decode
+    """
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, dict):
+        return [raw]
+    if not isinstance(raw, str):
+        return []
+ 
+    stripped = raw.strip()
+    if not stripped:
+        return []
+ 
+    # Fast path: proper JSON array
+    try:
+        result = json.loads(stripped)
+        if isinstance(result, list):
+            return result
+        return [result] if isinstance(result, dict) else []
+    except json.JSONDecodeError:
+        pass
+ 
+    # Slow path: space/newline-separated JSON objects
+    objects: list[dict] = []
+    decoder = json.JSONDecoder()
+    pos = 0
+    while pos < len(stripped):
+        # Skip leading whitespace between objects
+        remaining = stripped[pos:].lstrip()
+        if not remaining:
+            break
+        whitespace = len(stripped[pos:]) - len(remaining)
+        try:
+            obj, end = decoder.raw_decode(remaining)
+            if isinstance(obj, dict):
+                objects.append(obj)
+            pos += whitespace + end
+        except json.JSONDecodeError:
+            break
+ 
+    return objects
 
 class SupervisorAgent:
     """Klaudia supervisor: LangGraph hierarchical agent teams."""
@@ -82,7 +137,60 @@ class SupervisorAgent:
         self._mcp_sqlite = mcp_sqlite
         self._mcp_gsheets = mcp_gsheets
         self._langfuse = langfuse
+
+        # Sheet list cache — populated programmatically (no LLM, no tool hop in
+        # the agent loop). Injected into the system prompt every turn so workers
+        # can resolve sheet names without calling tool_list_sheets at runtime.
+        self._sheets_cache: str = ""
+        self._sheets_fetched_at: float = 0.0
+        self._list_sheets_tool = next(
+            (t for t in mcp_gsheets.tools if t.name == "tool_list_sheets"), None
+        )
         self._graph = self._build_graph()
+
+    # Sheet list cache helpers
+    # ------------------------------------------------------------------
+    def invalidate_sheets_cache(self) -> None:
+        """Force a cache miss on the next get_available_sheets() call.
+ 
+        Called automatically by make_data_entry_team_node whenever the
+        team reports [SHEET_DONE] (create/rename/delete sheet). This ensures
+        the injected sheet list reflects the mutation on the very next turn.
+        """
+        self._sheets_fetched_at = 0.0
+
+    async def get_available_sheets(self, ttl: float = 60.0) -> str:
+        """Return a formatted sheet list, refreshed at most every ttl seconds.
+ 
+        Python calls tool_list_sheets directly — no LLM involvement.
+        Fails soft: returns stale cache (or empty) if the tool errors so the
+        system prompt degrades gracefully rather than crashing.
+        """
+        now = time.monotonic()
+        if self._sheets_cache and (now - self._sheets_fetched_at) < ttl:
+            return self._sheets_cache
+ 
+        if self._list_sheets_tool is None:
+            return self._sheets_cache
+ 
+        try:
+            raw = await self._list_sheets_tool.ainvoke({})
+            sheets = _parse_tool_json_output(raw)
+            if sheets:
+                lines = [
+                    f"  - Index {s.get('index', i)}: {s.get('title', '?')}"
+                    for i, s in enumerate(sheets)
+                ]
+                self._sheets_cache = "\n".join(lines)
+            else:
+                # Tool returned something unexpected — keep previous cache
+                logger.warning("tool_list_sheets returned empty/unparseable output: %r", raw)
+            self._sheets_fetched_at = now
+        except Exception as exc:
+            logger.warning("Sheet list cache refresh failed: %s", exc)
+ 
+        return self._sheets_cache
+        # ------------------------------------------------------------------
 
     def _graph_config(
         self,
@@ -102,12 +210,18 @@ class SupervisorAgent:
             # Merge (callbacks + metadata + run_name) without clobbering recursion_limit
             config.update(lf_cfg)
         return config
-
+    
     def _build_graph(self):
         """Build the LangGraph supervisor graph."""
         supervisor_node = make_supervisor_node(self._llm)
         sql_agent_node = make_sql_agent_node(self._llm, self._mcp_sqlite)
-        data_entry_node = make_data_entry_team_node(self._llm, self._mcp_gsheets)
+        # Pass the cache-invalidation callback so structural sheet mutations
+        # (create/rename/delete) immediately bust the injected sheet list.
+        data_entry_node = make_data_entry_team_node(
+            self._llm,
+            self._mcp_gsheets,
+            on_sheet_mutation=self.invalidate_sheets_cache,
+        )
 
         builder = StateGraph(SupervisorState)
         builder.add_node("supervisor", supervisor_node)

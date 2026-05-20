@@ -1,5 +1,5 @@
 import logging
-from typing import Literal
+from typing import Any, Callable, Literal, Optional
 
 from langchain_core.messages import HumanMessage, ToolMessage
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -45,6 +45,12 @@ TERMINAL_MARKERS = ("[WRITE_DONE]", "[SHEET_DONE]", "[CLARIFY]")
 NON_TERMINAL_MARKERS = ("[READ_DONE]",)
 COMPLETION_MARKERS = TERMINAL_MARKERS + NON_TERMINAL_MARKERS
 
+# Minimal thinking for team_supervisor routing decisions (classification, not reasoning).
+# Workers (write_agent etc.) intentionally keep default/high thinking so they can
+# reason through multi-step composition patterns (Pattern B dedup, Pattern D column add).
+_MINIMAL_THINK: dict[str, Any] = {
+    "generation_config": {"thinking_config": {"thinking_level": "minimal"}}
+}
 
 class TeamRouter(TypedDict):
     next: str
@@ -160,7 +166,7 @@ def make_data_entry_team(llm: BaseChatModel, mcp_gsheets: MCPToolRegistry):
         )
 
     # Team supervisor node
-    def team_supervisor(state: SupervisorState) -> Command[Literal["read_agent", "sheet_agent", "write_agent", "__end__"]]:
+    async def team_supervisor(state: SupervisorState) -> Command[Literal["read_agent", "sheet_agent", "write_agent", "__end__"]]:
         # Deterministic completion gate — if the latest worker reply already carries
         # a TERMINAL marker, finish immediately without an LLM call. Prevents the
         # loop where the LLM re-routes to the same worker and triggers a duplicate
@@ -178,7 +184,12 @@ def make_data_entry_team(llm: BaseChatModel, mcp_gsheets: MCPToolRegistry):
         messages = [
             {"role": "system", "content": DATA_ENTRY_SUPERVISOR_PROMPT},
         ] + state["messages"]
-        response = llm.with_structured_output(TeamRouter).invoke(messages)
+        response = await (
+            llm
+            .bind(**_MINIMAL_THINK)
+            .with_structured_output(TeamRouter)
+            .ainvoke(messages)
+        )
         goto = _normalize_route(response["next"])
         if goto == "FINISH":
             goto = END
@@ -195,19 +206,36 @@ def make_data_entry_team(llm: BaseChatModel, mcp_gsheets: MCPToolRegistry):
     return builder.compile()
 
 
-def make_data_entry_team_node(llm: BaseChatModel, mcp_gsheets: MCPToolRegistry):
-    """Create the data entry team node for the top-level supervisor."""
+def make_data_entry_team_node(
+    llm: BaseChatModel,
+    mcp_gsheets: MCPToolRegistry,
+    on_sheet_mutation: Optional[Callable[[], None]] = None,
+):
+    """Create the data entry team node for the top-level supervisor.
+ 
+    on_sheet_mutation: optional zero-arg callback called when the team reports
+    a structural sheet change ([SHEET_DONE]). Used to invalidate the sheet
+    list cache in SupervisorAgent so the next turn gets a fresh list.
+    """
     team_graph = make_data_entry_team(llm, mcp_gsheets)
 
     async def data_entry_team_node(state: SupervisorState) -> Command[Literal["supervisor"]]:
         # Forward full message history so team supervisor + workers can resolve
         # multi-turn references (e.g. sheet name mentioned in earlier turns).
         response = await team_graph.ainvoke({"messages": state["messages"]})
+        last_content = coerce_to_text(response["messages"][-1].content)
+
+        # Cache invalidation: sheet structure changed — bust the injected list
+        # so the next system prompt reflects the current sheet layout.
+        if on_sheet_mutation is not None and "[SHEET_DONE]" in last_content:
+            logger.info("Sheet mutation detected — invalidating sheet list cache")
+            on_sheet_mutation()
+
         return Command(
             update={
                 "messages": [
                     HumanMessage(
-                        content=coerce_to_text(response["messages"][-1].content),
+                        content=last_content,
                         name="data_entry_team",
                     )
                 ]

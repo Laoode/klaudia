@@ -91,17 +91,17 @@ _CLARIFY_RULE = (
 )
 
 _SHEET_RESOLVE_RULE = (
-    "Resolving sheet name:\n"
-    "- If the user references a sheet by alias ('sheet pertama', 'first sheet', "
-    "'sheet ke-2', or no name at all), call tool_list_sheets first and pick by "
-    "index ('first' / 'pertama' = index 0).\n"
-    "- If the user gives an explicit sheet name, verify it exists by "
-    "tool_list_sheets first.\n"
-    "  * If it exists → proceed.\n"
-    "  * If it does NOT exist → return [CLARIFY Sheet '<name>' belum ada. "
-    "Sheet yang ada: <list>. Mau saya buatkan sheet '<name>' dulu?]. "
-    "Do NOT create the sheet yourself — that is sheet_agent's job after user "
-    "confirms."
+    "Resolving sheet name — FAST PATH FIRST:\n"
+    "- The system prompt contains an AVAILABLE SHEETS list (index → title).\n"
+    "- Use that list to resolve aliases like 'sheet pertama' (index 0), "
+    "'sheet ke-2' (index 1), or fuzzy name matches ('sari lautku' → 'Sari Laut').\n"
+    "- Only call tool_list_sheets if the system prompt list is absent or "
+    "you need to VERIFY a sheet actually still exists before a destructive write.\n"
+    "\n"
+    "If the resolved sheet does NOT appear in the system prompt list:\n"
+    "  Return [CLARIFY Sheet '<name>' tidak ditemukan. "
+    "Sheet yang tersedia: <list>. Mau dibuatkan sheet baru?]\n"
+    "Do NOT create the sheet yourself — that is sheet_agent's job."
 )
 
 _COMPOSITION_GUIDE = (
