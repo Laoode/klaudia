@@ -26,71 +26,31 @@ from klaudia.interfaces.tool_registry import MCPToolRegistry
 logger = logging.getLogger(__name__)
 
 MEMBERS = ["read_agent", "sheet_agent", "write_agent"]
-
 VALID_ROUTES = {*MEMBERS, "FINISH"}
 
-# Markers workers append to their final reply so the supervisor can detect
-# completion deterministically (no LLM judgement on whether the task is done).
-#
-# TERMINAL markers definitively end the team's turn — the work is fully done
-# (write/structural change committed) or the worker is blocked and needs the
-# user (clarify). We short-circuit to END on these.
-#
-# NON_TERMINAL markers indicate a sub-step finished but the user's overall ask
-# may still need another worker. [READ_DONE] is the only one today: a read-only
-# request fully terminates on it, but a compound request like "dedup + add
-# header" may pass through [READ_DONE] mid-flow if a worker over-uses it. We
-# defer those cases to the LLM router instead of force-FINISH.
 TERMINAL_MARKERS = ("[WRITE_DONE]", "[SHEET_DONE]", "[CLARIFY]")
 NON_TERMINAL_MARKERS = ("[READ_DONE]",)
 COMPLETION_MARKERS = TERMINAL_MARKERS + NON_TERMINAL_MARKERS
+WORK_DONE_MARKERS = ("[WRITE_DONE]", "[SHEET_DONE]", "[READ_DONE]")
 
-# Minimal thinking for team_supervisor routing decisions (classification, not reasoning).
-# Workers (write_agent etc.) intentionally keep default/high thinking so they can
-# reason through multi-step composition patterns (Pattern B dedup, Pattern D column add).
-_MINIMAL_THINK: dict[str, Any] = {
-    "generation_config": {"thinking_config": {"thinking_level": "minimal"}}
-}
 
 class TeamRouter(TypedDict):
     next: str
 
 
 def _normalize_route(raw: str) -> str:
-    """Extract just the agent name from an LLM response that may include extra detail.
-
-    e.g. "read_agent.get_sheet_data(...)" -> "read_agent"
-    """
     cleaned = raw.strip()
     for member in MEMBERS:
         if cleaned.startswith(member):
             return member
     if "FINISH" in cleaned.upper():
         return "FINISH"
-    logger.warning(f"Unrecognized route '{raw}', defaulting to FINISH")
+    logger.warning("Unrecognized route %r, defaulting to FINISH", raw)
     return "FINISH"
 
 
-def _has_completion_marker(content: str) -> bool:
-    """True if the worker output carries any known marker (terminal or not)."""
-    return any(marker in content for marker in COMPLETION_MARKERS)
-
-
 def _is_terminal_marker(content: str) -> bool:
-    """True if the worker's reply carries a marker that should END the team turn.
-
-    [READ_DONE] alone is intentionally NOT terminal here — for compound requests
-    (read → write to fulfil 'dedup + add header'), an early [READ_DONE] from a
-    misrouted read_agent would otherwise short-circuit the team before the
-    write happens. The LLM router decides what to do on [READ_DONE].
-    """
     return any(marker in content for marker in TERMINAL_MARKERS)
-
-
-# Markers that claim "I did some work". Emitting these without actually calling
-# any tool is hallucination — Gemini sometimes "promises not actions". The
-# worker-node guard rewrites such cases to [CLARIFY] so the user can redirect.
-WORK_DONE_MARKERS = ("[WRITE_DONE]", "[SHEET_DONE]", "[READ_DONE]")
 
 
 def _count_tool_messages(messages: list) -> int:
@@ -100,102 +60,85 @@ def _count_tool_messages(messages: list) -> int:
 def _ground_marker_against_tool_calls(
     agent_name: str, messages: list, fallback_question: str
 ) -> str:
-    """Return the worker's final text, but if it claims success without having
-    called any tool, substitute a [CLARIFY] message instead of trusting the
-    hallucinated marker. This is the last line of defense before the
-    deterministic gate.
-    """
+    """Guard against hallucinated *_DONE markers with no actual tool calls."""
     final_text = coerce_to_text(messages[-1].content)
     has_done_marker = any(m in final_text for m in WORK_DONE_MARKERS)
     if not has_done_marker:
         return final_text
-
-    n_tool_calls = _count_tool_messages(messages)
-    if n_tool_calls == 0:
+    if _count_tool_messages(messages) == 0:
         logger.warning(
-            f"{agent_name} emitted a *_DONE marker without any tool calls — "
-            f"rewriting to [CLARIFY]. Original final text: {final_text!r}"
+            "%s emitted a *_DONE marker without any tool calls — rewriting to [CLARIFY]. "
+            "Original: %r",
+            agent_name,
+            final_text,
         )
         return f"[CLARIFY] {fallback_question}"
     return final_text
 
 
-def make_data_entry_team(llm: BaseChatModel, mcp_gsheets: MCPToolRegistry):
-    """Build the data entry team subgraph."""
+def make_data_entry_team(
+    routing_llm: BaseChatModel,
+    worker_llm: BaseChatModel,
+    mcp_gsheets: MCPToolRegistry,
+):
+    """Build the data entry team subgraph.
 
-    # Create worker agents
-    read_agent = create_react_agent(llm, tools=get_read_tools(mcp_gsheets), prompt=READ_AGENT_PROMPT)
-    sheet_agent = create_react_agent(llm, tools=get_sheet_tools(mcp_gsheets), prompt=SHEET_AGENT_PROMPT)
-    write_agent = create_react_agent(llm, tools=get_write_tools(mcp_gsheets), prompt=WRITE_AGENT_PROMPT)
+    routing_llm: pre-bound with minimal thinking (team_supervisor routing call)
+    worker_llm:  pre-bound with low thinking (create_react_agent workers)
+    """
+    read_agent = create_react_agent(worker_llm, tools=get_read_tools(mcp_gsheets), prompt=READ_AGENT_PROMPT)
+    sheet_agent = create_react_agent(worker_llm, tools=get_sheet_tools(mcp_gsheets), prompt=SHEET_AGENT_PROMPT)
+    write_agent = create_react_agent(worker_llm, tools=get_write_tools(mcp_gsheets), prompt=WRITE_AGENT_PROMPT)
 
-    # Worker nodes — must be async because MCP tools only support async invocation.
     async def read_node(state: SupervisorState) -> Command[Literal["supervisor"]]:
         result = await read_agent.ainvoke(state)
         text = _ground_marker_against_tool_calls(
             "read_agent",
             result["messages"],
-            "Saya kesulitan membaca sheet yang Anda maksud. Bisakah Anda menjelaskan ulang sheet/range yang ingin dibaca?",
+            "Saya kesulitan membaca sheet yang Anda maksud. Bisakah Anda menjelaskan ulang?",
         )
-        return Command(
-            update={"messages": [HumanMessage(content=text, name="read_agent")]},
-            goto="supervisor",
-        )
+        return Command(update={"messages": [HumanMessage(content=text, name="read_agent")]}, goto="supervisor")
 
     async def sheet_node(state: SupervisorState) -> Command[Literal["supervisor"]]:
         result = await sheet_agent.ainvoke(state)
         text = _ground_marker_against_tool_calls(
             "sheet_agent",
             result["messages"],
-            "Saya gagal mengeksekusi perubahan struktur sheet. Bisakah Anda menjelaskan ulang langkahnya?",
+            "Saya gagal mengeksekusi perubahan struktur sheet. Bisakah Anda menjelaskan ulang?",
         )
-        return Command(
-            update={"messages": [HumanMessage(content=text, name="sheet_agent")]},
-            goto="supervisor",
-        )
+        return Command(update={"messages": [HumanMessage(content=text, name="sheet_agent")]}, goto="supervisor")
 
     async def write_node(state: SupervisorState) -> Command[Literal["supervisor"]]:
         result = await write_agent.ainvoke(state)
         text = _ground_marker_against_tool_calls(
             "write_agent",
             result["messages"],
-            "Saya tidak berhasil mengeksekusi operasi tulis tersebut. Bisakah Anda menjelaskan ulang langkahnya, atau memecahnya menjadi langkah yang lebih kecil?",
+            "Saya tidak berhasil mengeksekusi operasi tulis. Bisakah Anda menjelaskan ulang?",
         )
-        return Command(
-            update={"messages": [HumanMessage(content=text, name="write_agent")]},
-            goto="supervisor",
-        )
+        return Command(update={"messages": [HumanMessage(content=text, name="write_agent")]}, goto="supervisor")
 
-    # Team supervisor node
-    async def team_supervisor(state: SupervisorState) -> Command[Literal["read_agent", "sheet_agent", "write_agent", "__end__"]]:
-        # Deterministic completion gate — if the latest worker reply already carries
-        # a TERMINAL marker, finish immediately without an LLM call. Prevents the
-        # loop where the LLM re-routes to the same worker and triggers a duplicate
-        # write. Non-terminal markers ([READ_DONE]) fall through to the LLM router
-        # so compound flows (read→write) aren't cut short.
+    async def team_supervisor(
+        state: SupervisorState,
+    ) -> Command[Literal["read_agent", "sheet_agent", "write_agent", "__end__"]]:
         msgs = state.get("messages") or []
         if msgs:
             last = msgs[-1]
             last_name = getattr(last, "name", None)
             last_content = coerce_to_text(getattr(last, "content", ""))
             if last_name in MEMBERS and _is_terminal_marker(last_content):
-                logger.info(f"Team supervisor: deterministic FINISH (terminal marker from {last_name})")
+                logger.info(
+                    "Team supervisor: deterministic FINISH (terminal marker from %s)", last_name
+                )
                 return Command(goto=END, update={"next": "FINISH"})
 
-        messages = [
-            {"role": "system", "content": DATA_ENTRY_SUPERVISOR_PROMPT},
-        ] + state["messages"]
-        response = await (
-            llm
-            .bind(**_MINIMAL_THINK)
-            .with_structured_output(TeamRouter)
-            .ainvoke(messages)
-        )
+        messages = [{"role": "system", "content": DATA_ENTRY_SUPERVISOR_PROMPT}] + state["messages"]
+        # routing_llm is pre-bound with minimal thinking — classification task only.
+        response = await routing_llm.with_structured_output(TeamRouter).ainvoke(messages)
         goto = _normalize_route(response["next"])
         if goto == "FINISH":
             goto = END
         return Command(goto=goto, update={"next": goto})
 
-    # Build subgraph
     builder = StateGraph(SupervisorState)
     builder.add_node("supervisor", team_supervisor)
     builder.add_node("read_agent", read_node)
@@ -207,39 +150,29 @@ def make_data_entry_team(llm: BaseChatModel, mcp_gsheets: MCPToolRegistry):
 
 
 def make_data_entry_team_node(
-    llm: BaseChatModel,
+    routing_llm: BaseChatModel,
+    worker_llm: BaseChatModel,
     mcp_gsheets: MCPToolRegistry,
     on_sheet_mutation: Optional[Callable[[], None]] = None,
 ):
     """Create the data entry team node for the top-level supervisor.
- 
-    on_sheet_mutation: optional zero-arg callback called when the team reports
-    a structural sheet change ([SHEET_DONE]). Used to invalidate the sheet
-    list cache in SupervisorAgent so the next turn gets a fresh list.
+
+    on_sheet_mutation: optional zero-arg callback fired when the team reports
+    [SHEET_DONE]. Used by SupervisorAgent to invalidate the sheet list cache.
     """
-    team_graph = make_data_entry_team(llm, mcp_gsheets)
+    team_graph = make_data_entry_team(routing_llm, worker_llm, mcp_gsheets)
 
     async def data_entry_team_node(state: SupervisorState) -> Command[Literal["supervisor"]]:
-        # Forward full message history so team supervisor + workers can resolve
-        # multi-turn references (e.g. sheet name mentioned in earlier turns).
         response = await team_graph.ainvoke({"messages": state["messages"]})
         last_content = coerce_to_text(response["messages"][-1].content)
 
-        # Cache invalidation: sheet structure changed — bust the injected list
-        # so the next system prompt reflects the current sheet layout.
+        # Cache invalidation: structural sheet change detected.
         if on_sheet_mutation is not None and "[SHEET_DONE]" in last_content:
             logger.info("Sheet mutation detected — invalidating sheet list cache")
             on_sheet_mutation()
 
         return Command(
-            update={
-                "messages": [
-                    HumanMessage(
-                        content=last_content,
-                        name="data_entry_team",
-                    )
-                ]
-            },
+            update={"messages": [HumanMessage(content=last_content, name="data_entry_team")]},
             goto="supervisor",
         )
 

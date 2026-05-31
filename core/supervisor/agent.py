@@ -17,59 +17,35 @@ from klaudia.models.message import AgentResponse
 
 logger = logging.getLogger(__name__)
 
-# Names of sub-agent / team nodes whose final message can serve as a fallback
-# when the supervisor's own final reply is empty.
 _FALLBACK_NAMES = ("data_entry_team", "sql_agent", "read_agent", "sheet_agent", "write_agent")
 
 
 def _resolve_final_content(messages: list[Any]) -> str:
-    """Pick the user-facing reply for THIS turn.
-
-    Strategy (turn-scoped — must NOT leak earlier turns):
-    1. If the LAST message is an AIMessage with content, that's the supervisor's
-       fresh reply — return it.
-    2. Otherwise fall back to the most recent named-worker message (its
-       confirmation text with internal markers stripped). The worker's reply
-       was generated this turn; it is safe to surface.
-    3. Otherwise empty.
-
-    IMPORTANT: We deliberately do NOT walk past a non-AI tail to find an
-    earlier AIMessage. In a multi-turn conversation the message list contains
-    previous assistant replies (from DB history); returning one of those would
-    make the assistant repeat itself when the current turn produced an empty
-    reply (e.g. Gemini emits a signature-only chunk). The empty reply must
-    instead degrade gracefully to the worker's confirmation.
-    """
     if not messages:
         return ""
-
     last = messages[-1]
     if isinstance(last, AIMessage):
         text = coerce_to_text(last.content)
         if text:
             return text
-
     for msg in reversed(messages):
         if getattr(msg, "name", None) in _FALLBACK_NAMES:
             text = strip_internal_markers(coerce_to_text(getattr(msg, "content", "")))
             if text:
                 return text
-
     return ""
+
 
 def _parse_tool_json_output(raw: Any) -> list[dict]:
     """Parse MCP tool_list_sheets output into a list of sheet dicts.
- 
+
     The MCP server serialises each sheet as a separate JSON object and
-    concatenates them with spaces/newlines — NOT as a JSON array:
-        {"title": "Sari Laut", ...} {"title": "Indomaret", ...}
- 
-    json.loads() fails with "Extra data" on this format. We walk through the
-    string with JSONDecoder.raw_decode() to extract objects one by one.
-    Handles all three variants:
-        - Already a Python list  → return as-is
-        - Proper JSON array      → json.loads
-        - Concatenated objects   → iterative raw_decode
+    concatenates them with spaces — NOT a JSON array. json.loads() fails with
+    "Extra data" on this format. We use JSONDecoder.raw_decode() to walk through.
+    Handles:
+        - Already a Python list      → return as-is
+        - Proper JSON array string   → json.loads
+        - Concatenated JSON objects  → iterative raw_decode
     """
     if isinstance(raw, list):
         return raw
@@ -77,11 +53,11 @@ def _parse_tool_json_output(raw: Any) -> list[dict]:
         return [raw]
     if not isinstance(raw, str):
         return []
- 
+
     stripped = raw.strip()
     if not stripped:
         return []
- 
+
     # Fast path: proper JSON array
     try:
         result = json.loads(stripped)
@@ -90,26 +66,26 @@ def _parse_tool_json_output(raw: Any) -> list[dict]:
         return [result] if isinstance(result, dict) else []
     except json.JSONDecodeError:
         pass
- 
+
     # Slow path: space/newline-separated JSON objects
     objects: list[dict] = []
     decoder = json.JSONDecoder()
     pos = 0
     while pos < len(stripped):
-        # Skip leading whitespace between objects
         remaining = stripped[pos:].lstrip()
         if not remaining:
             break
-        whitespace = len(stripped[pos:]) - len(remaining)
+        whitespace_skipped = len(stripped[pos:]) - len(remaining)
         try:
             obj, end = decoder.raw_decode(remaining)
             if isinstance(obj, dict):
                 objects.append(obj)
-            pos += whitespace + end
+            pos += whitespace_skipped + end
         except json.JSONDecodeError:
             break
- 
+
     return objects
+
 
 class SupervisorAgent:
     """Klaudia supervisor: LangGraph hierarchical agent teams."""
@@ -125,8 +101,10 @@ class SupervisorAgent:
         google_cloud_project: str = "",
         google_cloud_location: str = "global",
         temperature: float = 0.5,
+        thinking_level_routing: str = "minimal",
+        thinking_level_worker: str = "low",
     ) -> None:
-        self._llm = build_chat_llm(
+        _llm_kwargs = dict(
             model=llm_model,
             temperature=temperature,
             use_vertexai=use_vertexai,
@@ -134,45 +112,53 @@ class SupervisorAgent:
             google_cloud_project=google_cloud_project,
             google_cloud_location=google_cloud_location,
         )
+        # Two pre-bound LLM variants — no thinking config scattered across files.
+        # routing_llm: minimal thinking for classification + summarization tasks.
+        # worker_llm:  low thinking for tool-augmented reasoning (write/read/sql).
+        self._routing_llm = build_chat_llm(**_llm_kwargs, thinking_level=thinking_level_routing)
+        self._worker_llm = build_chat_llm(**_llm_kwargs, thinking_level=thinking_level_worker)
+
         self._mcp_sqlite = mcp_sqlite
         self._mcp_gsheets = mcp_gsheets
         self._langfuse = langfuse
 
-        # Sheet list cache — populated programmatically (no LLM, no tool hop in
-        # the agent loop). Injected into the system prompt every turn so workers
-        # can resolve sheet names without calling tool_list_sheets at runtime.
+        # Sheet list cache — populated programmatically via tool_list_sheets.
+        # Injected into system prompt every turn so workers resolve sheet names
+        # without burning an agent LLM hop on tool_list_sheets at runtime.
         self._sheets_cache: str = ""
         self._sheets_fetched_at: float = 0.0
         self._list_sheets_tool = next(
             (t for t in mcp_gsheets.tools if t.name == "tool_list_sheets"), None
         )
+
         self._graph = self._build_graph()
 
+    # ------------------------------------------------------------------
     # Sheet list cache helpers
     # ------------------------------------------------------------------
+
     def invalidate_sheets_cache(self) -> None:
         """Force a cache miss on the next get_available_sheets() call.
- 
-        Called automatically by make_data_entry_team_node whenever the
-        team reports [SHEET_DONE] (create/rename/delete sheet). This ensures
-        the injected sheet list reflects the mutation on the very next turn.
+
+        Called automatically by make_data_entry_team_node whenever the team
+        reports [SHEET_DONE] (create/rename/delete). Ensures the next turn's
+        system prompt reflects the post-mutation sheet layout.
         """
         self._sheets_fetched_at = 0.0
 
     async def get_available_sheets(self, ttl: float = 60.0) -> str:
         """Return a formatted sheet list, refreshed at most every ttl seconds.
- 
-        Python calls tool_list_sheets directly — no LLM involvement.
-        Fails soft: returns stale cache (or empty) if the tool errors so the
-        system prompt degrades gracefully rather than crashing.
+
+        Python calls tool_list_sheets directly — no LLM involvement, no agent
+        hop. Fails soft: returns stale cache (or empty string) on error.
         """
         now = time.monotonic()
         if self._sheets_cache and (now - self._sheets_fetched_at) < ttl:
             return self._sheets_cache
- 
+
         if self._list_sheets_tool is None:
             return self._sheets_cache
- 
+
         try:
             raw = await self._list_sheets_tool.ainvoke({})
             sheets = _parse_tool_json_output(raw)
@@ -183,14 +169,14 @@ class SupervisorAgent:
                 ]
                 self._sheets_cache = "\n".join(lines)
             else:
-                # Tool returned something unexpected — keep previous cache
                 logger.warning("tool_list_sheets returned empty/unparseable output: %r", raw)
             self._sheets_fetched_at = now
         except Exception as exc:
             logger.warning("Sheet list cache refresh failed: %s", exc)
- 
+
         return self._sheets_cache
-        # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
 
     def _graph_config(
         self,
@@ -198,7 +184,6 @@ class SupervisorAgent:
         user_id: Optional[int],
         run_name: str,
     ) -> dict[str, Any]:
-        """Base RunnableConfig + optional Langfuse callback + trace metadata."""
         config: dict[str, Any] = {"recursion_limit": 50}
         if self._langfuse is not None:
             lf_cfg = self._langfuse.langchain_config(
@@ -207,19 +192,18 @@ class SupervisorAgent:
                 run_name=run_name,
                 tags=["klaudia", "supervisor"],
             )
-            # Merge (callbacks + metadata + run_name) without clobbering recursion_limit
             config.update(lf_cfg)
         return config
-    
+
     def _build_graph(self):
-        """Build the LangGraph supervisor graph."""
-        supervisor_node = make_supervisor_node(self._llm)
-        sql_agent_node = make_sql_agent_node(self._llm, self._mcp_sqlite)
-        # Pass the cache-invalidation callback so structural sheet mutations
-        # (create/rename/delete) immediately bust the injected sheet list.
+        # routing_llm → supervisor node + team_supervisor (classification tasks)
+        # worker_llm  → sql_agent + worker agents (tool-augmented reasoning)
+        supervisor_node = make_supervisor_node(self._routing_llm)
+        sql_agent_node = make_sql_agent_node(self._worker_llm, self._mcp_sqlite)
         data_entry_node = make_data_entry_team_node(
-            self._llm,
-            self._mcp_gsheets,
+            routing_llm=self._routing_llm,
+            worker_llm=self._worker_llm,
+            mcp_gsheets=self._mcp_gsheets,
             on_sheet_mutation=self.invalidate_sheets_cache,
         )
 
@@ -238,32 +222,24 @@ class SupervisorAgent:
         session_id: int | None = None,
         user_id: int | None = None,
     ) -> AgentResponse:
-        """Run the supervisor graph on the given messages."""
-        state = {
-            "messages": messages,
-            "extraction_data": extraction_data,
-        }
-
+        state = {"messages": messages, "extraction_data": extraction_data}
         config = self._graph_config(session_id, user_id, run_name="klaudia.supervisor.invoke")
         result = await self._graph.ainvoke(state, config)
 
         content = _resolve_final_content(result["messages"])
         if not content:
-            logger.warning("Supervisor produced no user-facing content; falling back to empty string")
+            logger.warning("Supervisor produced no user-facing content")
 
-        # Collect tools used from message names
-        tools_used = []
-        for msg in result["messages"]:
-            name = getattr(msg, "name", None)
-            if name and name not in ("user", "system"):
-                tools_used.append(name)
-
-        routed_to = result.get("next", "FINISH")
+        tools_used = [
+            getattr(msg, "name", None)
+            for msg in result["messages"]
+            if getattr(msg, "name", None) and getattr(msg, "name") not in ("user", "system")
+        ]
 
         return AgentResponse(
             content=content,
             tools_called=tools_used,
-            metadata={"routed_to": routed_to},
+            metadata={"routed_to": result.get("next", "FINISH")},
         )
 
     async def stream_conversation(
@@ -273,19 +249,7 @@ class SupervisorAgent:
         session_id: int | None = None,
         user_id: int | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
-        """Stream the supervisor graph as structured events.
-
-        Event shape: {"type": <name>, "data": <payload>}
-        Types emitted:
-          - step:  graph node transition (node, next)
-          - token: final-answer token (only tag="final_answer")
-          - tool:  tool invocation observed in node output
-          - final: end-of-stream aggregate (content, tools_called, metadata)
-        """
-        state = {
-            "messages": messages,
-            "extraction_data": extraction_data,
-        }
+        state = {"messages": messages, "extraction_data": extraction_data}
 
         final_chunks: list[str] = []
         tools_used: list[str] = []
@@ -325,9 +289,6 @@ class SupervisorAgent:
                             tools_used.append(name)
                             yield {"type": "tool", "data": {"name": name}}
 
-        # Streamed tokens take precedence; fall back to whatever message
-        # content we observed if no token-level callbacks fired (provider-
-        # dependent) or if Gemini emitted an empty AIMessage at FINISH.
         streamed = "".join(final_chunks).strip()
         content = streamed or _resolve_final_content(observed_messages)
 
