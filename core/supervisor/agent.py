@@ -4,10 +4,12 @@ import time
 from typing import Any, AsyncIterator, Optional
 
 from langchain_core.messages import AIMessage
-from langgraph.graph import StateGraph, START
+from langgraph.graph import START, StateGraph
 
 from klaudia.core.supervisor._content import coerce_to_text, strip_internal_markers
-from klaudia.core.supervisor.agents.data_entry_team.agents import make_data_entry_team_node
+from klaudia.core.supervisor.agents.data_entry_team.agents import (
+    make_data_entry_team_node,
+)
 from klaudia.core.supervisor.agents.sql_agent.agent import make_sql_agent_node
 from klaudia.core.supervisor.llm import build_chat_llm
 from klaudia.core.supervisor.router import make_supervisor_node
@@ -17,7 +19,13 @@ from klaudia.models.message import AgentResponse
 
 logger = logging.getLogger(__name__)
 
-_FALLBACK_NAMES = ("data_entry_team", "sql_agent", "read_agent", "sheet_agent", "write_agent")
+_FALLBACK_NAMES = (
+    "data_entry_team",
+    "sql_agent",
+    "read_agent",
+    "sheet_agent",
+    "write_agent",
+)
 
 
 def _resolve_final_content(messages: list[Any]) -> str:
@@ -115,8 +123,12 @@ class SupervisorAgent:
         # Two pre-bound LLM variants — no thinking config scattered across files.
         # routing_llm: minimal thinking for classification + summarization tasks.
         # worker_llm:  low thinking for tool-augmented reasoning (write/read/sql).
-        self._routing_llm = build_chat_llm(**_llm_kwargs, thinking_level=thinking_level_routing)
-        self._worker_llm = build_chat_llm(**_llm_kwargs, thinking_level=thinking_level_worker)
+        self._routing_llm = build_chat_llm(
+            **_llm_kwargs, thinking_level=thinking_level_routing
+        )
+        self._worker_llm = build_chat_llm(
+            **_llm_kwargs, thinking_level=thinking_level_worker
+        )
 
         self._mcp_sqlite = mcp_sqlite
         self._mcp_gsheets = mcp_gsheets
@@ -168,9 +180,12 @@ class SupervisorAgent:
                     for i, s in enumerate(sheets)
                 ]
                 self._sheets_cache = "\n".join(lines)
+                self._sheets_fetched_at = now
             else:
-                logger.warning("tool_list_sheets returned empty/unparseable output: %r", raw)
-            self._sheets_fetched_at = now
+                logger.warning(
+                    "tool_list_sheets returned empty/unparseable output: %r", raw
+                )
+            # self._sheets_fetched_at = now
         except Exception as exc:
             logger.warning("Sheet list cache refresh failed: %s", exc)
 
@@ -223,7 +238,9 @@ class SupervisorAgent:
         user_id: int | None = None,
     ) -> AgentResponse:
         state = {"messages": messages, "extraction_data": extraction_data}
-        config = self._graph_config(session_id, user_id, run_name="klaudia.supervisor.invoke")
+        config = self._graph_config(
+            session_id, user_id, run_name="klaudia.supervisor.invoke"
+        )
         result = await self._graph.ainvoke(state, config)
 
         content = _resolve_final_content(result["messages"])
@@ -233,7 +250,8 @@ class SupervisorAgent:
         tools_used = [
             getattr(msg, "name", None)
             for msg in result["messages"]
-            if getattr(msg, "name", None) and getattr(msg, "name") not in ("user", "system")
+            if getattr(msg, "name", None)
+            and getattr(msg, "name") not in ("user", "system")
         ]
 
         return AgentResponse(
@@ -256,7 +274,9 @@ class SupervisorAgent:
         routed_to = "FINISH"
         observed_messages: list[Any] = []
 
-        stream_config = self._graph_config(session_id, user_id, run_name="klaudia.supervisor.stream")
+        stream_config = self._graph_config(
+            session_id, user_id, run_name="klaudia.supervisor.stream"
+        )
 
         async for mode, payload in self._graph.astream(
             state,
