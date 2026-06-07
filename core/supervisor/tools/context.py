@@ -13,8 +13,13 @@ def build_session_context(session_files: list[dict[str, Any]] | None) -> str:
     lines: list[str] = []
     for i, f in enumerate(session_files, 1):
         pages_info = f.get("pages", [])
-        extracted = sum(1 for p in pages_info if p.get("status") == "extracted")
-        total = len(pages_info) if pages_info else f.get("total_pages", 0)
+        if pages_info:
+            extracted = sum(1 for p in pages_info if p.get("status") == "extracted")
+            total = len(pages_info)
+        else:
+            # Page-level details not loaded — infer from file-level status
+            total = f.get("total_pages", 0)
+            extracted = total if f.get("status") == "completed" else 0
         lines.append(
             f"{i}. {f.get('file_name', 'unknown')}\n"
             f"   - Type: {f.get('type', 'unknown')}\n"

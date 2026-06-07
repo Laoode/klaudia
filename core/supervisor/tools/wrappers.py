@@ -8,14 +8,20 @@ logger = logging.getLogger(__name__)
 
 
 def get_sql_tools(registry: MCPToolRegistry) -> list[BaseTool]:
-    """Get MCP-SQLite tools filtered for SQL Agent use."""
+    """Get MCP-SQLite tools filtered for SQL Agent use.
+
+    tool_list_documents is intentionally excluded: the SESSION FILES section
+    of the system prompt already contains file IDs for the current session,
+    so the agent should call tool_get_extraction directly. For cases where
+    the user asks to browse all uploaded files, tool_get_session_files is
+    strictly more informative (returns nested page + extraction status).
+    """
     allowed = {
         "tool_get_document",
-        "tool_list_documents",
+        "tool_get_session_files",  # replaces tool_list_documents; returns pages too
         "tool_list_pages",
         "tool_get_page",
         "tool_get_extraction",
-        "tool_get_session_files",
     }
     return [t for t in registry.tools if t.name in allowed]
 
