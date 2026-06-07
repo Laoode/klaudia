@@ -25,6 +25,19 @@ Routing logic:
    (e.g., sheet_agent created a sheet, now write_agent must fill it),
    route to that worker exactly once.
 
+DISPATCH DISCIPLINE — CRITICAL:
+- A worker MUST run before FINISH is valid for any write/insert/update/record request.
+  FINISH without a prior worker = routing failure. Do NOT do this.
+- For "masukkan", "catat", "input", "tambahkan", "record", "insert", "update",
+  "append" operations → ALWAYS dispatch write_agent. Never FINISH directly.
+- If [Extraction Result] data is visible in the conversation context and the user
+  asks to insert/record it into a sheet → dispatch write_agent immediately.
+  The extraction JSON is the data source; write_agent reads it from context.
+- FINISH is ONLY valid when:
+  (a) A worker just completed AND its message contains [WRITE_DONE], [SHEET_DONE],
+      [CLARIFY], or [READ_DONE].
+  (b) The request is a pure greeting or question with no data operation needed.
+
 IMPORTANT: The MCP server has a default spreadsheet configured via SHEET_ID env var.
 Never ask the user for a spreadsheet ID — workers call tools without spreadsheet_id
 and the server resolves the default automatically.
@@ -93,8 +106,12 @@ _CLARIFY_RULE = (
 _SHEET_RESOLVE_RULE = (
     "Resolving sheet name — FAST PATH FIRST:\n"
     "- The system prompt contains an AVAILABLE SHEETS list (index → title).\n"
-    "- Use that list to resolve aliases like 'sheet pertama' (index 0), "
-    "'sheet ke-2' (index 1), or fuzzy name matches ('sari lautku' → 'Sari Laut').\n"
+    "- Copy the sheet title VERBATIM from that list (exact spelling, exact spacing,\n"
+    "  exact punctuation including dashes, apostrophes, and trailing characters).\n"
+    "  DO NOT normalise, add, or remove any characters. A single space difference\n"
+    "  causes a Google Sheets API 400 error.\n"
+    "- Use fuzzy logic only to resolve user ALIASES ('sheet pertama' → index 0 title,\n"
+    "  'sheet ke-2' → index 1 title). The VERBATIM rule applies to the resolved title.\n"
     "- Only call tool_list_sheets if the system prompt list is absent or "
     "you need to VERIFY a sheet actually still exists before a destructive write.\n"
     "\n"
@@ -193,6 +210,12 @@ Return data clearly and structured. Don't ask follow-up questions unless blocked
 
 {_DEFAULT_SHEET_RULE}
 
+TOOL USAGE NOTES:
+- tool_get_sheet_data(sheet)                      → reads entire sheet (no range needed)
+- tool_get_multiple_sheet_data([{{"sheet": "..."}}, ...]) → reads multiple sheets at once;
+  'range' is optional (omit to read the whole sheet); 'spreadsheet_id' is optional.
+  Minimal call: tool_get_multiple_sheet_data([{{"sheet": "Sheet1"}}, {{"sheet": "Sheet2"}}])
+
 {_SHEET_RESOLVE_RULE}
 
 {_EXECUTION_RULE}
@@ -232,6 +255,24 @@ operations the user expects of a normal data-entry person:
 
 Never refuse a compound write request because "I cannot do X automatically" —
 if the primitives exist, compose them.
+
+RECEIPT/STRUK DATA INSERTION (when [Extraction Result] is in conversation context):
+  If the user asks to masukkan / catat / input receipt data into a purchase sheet:
+  1. tool_get_sheet_data(sheet) → read header row to identify column order
+  2. Write ONE ROW PER ITEM from the extraction items array (not a summary row)
+     Typical column mapping for a purchase ledger:
+     - Date column    → use TODAY\'s date from system prompt (not the receipt date),
+                         unless the user explicitly asks for the receipt date
+     - Merchant column → store_name from extraction.info
+     - Item column    → item_name from each item
+     - Quantity column → quantity from each item
+     - Unit Price column → effective price per unit after discount:
+                           if no discount: use unit_price as-is
+                           if discounted: total_price / quantity
+     - Total column   → total_price from each item
+  3. Use tool_append_rows to add rows at the end. Do NOT use clear_range.
+  4. Write numbers as plain values (no Rp / IDR prefix — the sheet header handles that)
+  5. If the sheet has fewer or more columns, adapt the mapping to what you read in step 1.
 
 {_DEFAULT_SHEET_RULE}
 

@@ -1,9 +1,9 @@
 import logging
 from typing import Any, Callable, Literal, Optional
 
-from langchain_core.messages import HumanMessage, ToolMessage
 from langchain_core.language_models.chat_models import BaseChatModel
-from langgraph.graph import StateGraph, START, END
+from langchain_core.messages import HumanMessage, ToolMessage
+from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import create_react_agent
 from langgraph.types import Command
 from typing_extensions import TypedDict
@@ -86,9 +86,15 @@ def make_data_entry_team(
     routing_llm: pre-bound with minimal thinking (team_supervisor routing call)
     worker_llm:  pre-bound with low thinking (create_react_agent workers)
     """
-    read_agent = create_react_agent(worker_llm, tools=get_read_tools(mcp_gsheets), prompt=READ_AGENT_PROMPT)
-    sheet_agent = create_react_agent(worker_llm, tools=get_sheet_tools(mcp_gsheets), prompt=SHEET_AGENT_PROMPT)
-    write_agent = create_react_agent(worker_llm, tools=get_write_tools(mcp_gsheets), prompt=WRITE_AGENT_PROMPT)
+    read_agent = create_react_agent(
+        worker_llm, tools=get_read_tools(mcp_gsheets), prompt=READ_AGENT_PROMPT
+    )
+    sheet_agent = create_react_agent(
+        worker_llm, tools=get_sheet_tools(mcp_gsheets), prompt=SHEET_AGENT_PROMPT
+    )
+    write_agent = create_react_agent(
+        worker_llm, tools=get_write_tools(mcp_gsheets), prompt=WRITE_AGENT_PROMPT
+    )
 
     async def read_node(state: SupervisorState) -> Command[Literal["supervisor"]]:
         result = await read_agent.ainvoke(state)
@@ -97,7 +103,10 @@ def make_data_entry_team(
             result["messages"],
             "Saya kesulitan membaca sheet yang Anda maksud. Bisakah Anda menjelaskan ulang?",
         )
-        return Command(update={"messages": [HumanMessage(content=text, name="read_agent")]}, goto="supervisor")
+        return Command(
+            update={"messages": [HumanMessage(content=text, name="read_agent")]},
+            goto="supervisor",
+        )
 
     async def sheet_node(state: SupervisorState) -> Command[Literal["supervisor"]]:
         result = await sheet_agent.ainvoke(state)
@@ -106,7 +115,10 @@ def make_data_entry_team(
             result["messages"],
             "Saya gagal mengeksekusi perubahan struktur sheet. Bisakah Anda menjelaskan ulang?",
         )
-        return Command(update={"messages": [HumanMessage(content=text, name="sheet_agent")]}, goto="supervisor")
+        return Command(
+            update={"messages": [HumanMessage(content=text, name="sheet_agent")]},
+            goto="supervisor",
+        )
 
     async def write_node(state: SupervisorState) -> Command[Literal["supervisor"]]:
         result = await write_agent.ainvoke(state)
@@ -115,7 +127,10 @@ def make_data_entry_team(
             result["messages"],
             "Saya tidak berhasil mengeksekusi operasi tulis. Bisakah Anda menjelaskan ulang?",
         )
-        return Command(update={"messages": [HumanMessage(content=text, name="write_agent")]}, goto="supervisor")
+        return Command(
+            update={"messages": [HumanMessage(content=text, name="write_agent")]},
+            goto="supervisor",
+        )
 
     async def team_supervisor(
         state: SupervisorState,
@@ -127,13 +142,18 @@ def make_data_entry_team(
             last_content = coerce_to_text(getattr(last, "content", ""))
             if last_name in MEMBERS and _is_terminal_marker(last_content):
                 logger.info(
-                    "Team supervisor: deterministic FINISH (terminal marker from %s)", last_name
+                    "Team supervisor: deterministic FINISH (terminal marker from %s)",
+                    last_name,
                 )
                 return Command(goto=END, update={"next": "FINISH"})
 
-        messages = [{"role": "system", "content": DATA_ENTRY_SUPERVISOR_PROMPT}] + state["messages"]
+        messages = [
+            {"role": "system", "content": DATA_ENTRY_SUPERVISOR_PROMPT}
+        ] + state["messages"]
         # routing_llm is pre-bound with minimal thinking — classification task only.
-        response = await routing_llm.with_structured_output(TeamRouter).ainvoke(messages)
+        response = await routing_llm.with_structured_output(TeamRouter).ainvoke(
+            messages
+        )
         goto = _normalize_route(response["next"])
         if goto == "FINISH":
             goto = END
@@ -162,9 +182,30 @@ def make_data_entry_team_node(
     """
     team_graph = make_data_entry_team(routing_llm, worker_llm, mcp_gsheets)
 
-    async def data_entry_team_node(state: SupervisorState) -> Command[Literal["supervisor"]]:
+    async def data_entry_team_node(
+        state: SupervisorState,
+    ) -> Command[Literal["supervisor"]]:
         response = await team_graph.ainvoke({"messages": state["messages"]})
-        last_content = coerce_to_text(response["messages"][-1].content)
+        last_msg = response["messages"][-1]
+        last_name = getattr(last_msg, "name", None)
+        last_content = coerce_to_text(getattr(last_msg, "content", ""))
+
+        # Safety guard: team_supervisor must have dispatched a worker before
+        # returning. If last_name is not from a MEMBER the team graph exited
+        # without running any agent (last message is the original user turn).
+        # Returning that as a "data_entry_team" message causes _emit_final_reply
+        # to hallucinate success — emit [CLARIFY] instead.
+        if last_name not in MEMBERS:
+            logger.warning(
+                "data_entry_team: team_supervisor exited without dispatching a "
+                "worker (last_name=%r, snippet=%r). Emitting [CLARIFY].",
+                last_name,
+                last_content[:120],
+            )
+            last_content = (
+                "[CLARIFY] Saya tidak dapat menyelesaikan operasi ini secara otomatis. "
+                "Mohon jelaskan lebih detail apa yang ingin dicatat dan ke sheet mana."
+            )
 
         # Cache invalidation: structural sheet change detected.
         if on_sheet_mutation is not None and "[SHEET_DONE]" in last_content:
@@ -172,7 +213,9 @@ def make_data_entry_team_node(
             on_sheet_mutation()
 
         return Command(
-            update={"messages": [HumanMessage(content=last_content, name="data_entry_team")]},
+            update={
+                "messages": [HumanMessage(content=last_content, name="data_entry_team")]
+            },
             goto="supervisor",
         )
 
