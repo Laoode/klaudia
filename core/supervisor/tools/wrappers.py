@@ -67,6 +67,7 @@ def get_write_tools(registry: MCPToolRegistry) -> list[BaseTool]:
     allowed = {
         # Read primitives needed to ground writes in actual sheet state.
         "tool_get_sheet_data",
+        "tool_get_multiple_sheet_data",
         "tool_list_sheets",
         # Write primitives.
         "tool_update_cells",
