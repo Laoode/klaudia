@@ -8,6 +8,7 @@ from langgraph.types import Command
 from typing_extensions import TypedDict
 
 from klaudia.core.supervisor._content import coerce_to_text, strip_internal_markers
+from klaudia.core.supervisor.llm import with_structured
 from klaudia.core.supervisor.prompts import SUPERVISOR_ROUTING_PROMPT
 from klaudia.core.supervisor.state import SupervisorState
 
@@ -81,8 +82,7 @@ def make_supervisor_node(llm: BaseChatModel):
         messages = [{"role": "system", "content": SUPERVISOR_ROUTING_PROMPT},] + state_messages
 
         combined_llm = (
-            llm
-            .with_structured_output(RouterWithResponse)
+            with_structured(llm, RouterWithResponse)
             .with_config({"tags": ["nostream"]})
         )
         result = await combined_llm.ainvoke(messages)

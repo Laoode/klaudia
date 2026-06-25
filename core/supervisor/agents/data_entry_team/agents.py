@@ -9,6 +9,7 @@ from langgraph.types import Command
 from typing_extensions import TypedDict
 
 from klaudia.core.supervisor._content import coerce_to_text
+from klaudia.core.supervisor.llm import with_structured
 from klaudia.core.supervisor.agents.data_entry_team.prompts import (
     DATA_ENTRY_SUPERVISOR_PROMPT,
     READ_AGENT_PROMPT,
@@ -151,9 +152,7 @@ def make_data_entry_team(
             {"role": "system", "content": DATA_ENTRY_SUPERVISOR_PROMPT}
         ] + state["messages"]
         # routing_llm is pre-bound with minimal thinking — classification task only.
-        response = await routing_llm.with_structured_output(TeamRouter).ainvoke(
-            messages
-        )
+        response = await with_structured(routing_llm, TeamRouter).ainvoke(messages)
         goto = _normalize_route(response["next"])
         if goto == "FINISH":
             goto = END

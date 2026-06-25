@@ -105,24 +105,34 @@ class SupervisorAgent:
         mcp_sqlite: MCPToolRegistry,
         mcp_gsheets: MCPToolRegistry,
         langfuse: Optional[Any] = None,
+        provider: str = "google",
         use_vertexai: bool = False,
         google_cloud_project: str = "",
         google_cloud_location: str = "global",
+        openai_base_url: str = "",
+        openai_api_key: str = "",
+        disable_thinking: bool = True,
         temperature: float = 0.5,
         thinking_level_routing: str = "minimal",
-        thinking_level_worker: str = "low",
+        thinking_level_worker: str = "minimal",
     ) -> None:
+        # Shared across both LLM variants. For provider="openai" the Gemini
+        # kwargs (use_vertexai/project/location) are ignored, and vice-versa.
         _llm_kwargs = dict(
             model=llm_model,
+            provider=provider,
             temperature=temperature,
             use_vertexai=use_vertexai,
             llm_api_key=llm_api_key,
             google_cloud_project=google_cloud_project,
             google_cloud_location=google_cloud_location,
+            openai_base_url=openai_base_url,
+            openai_api_key=openai_api_key,
+            disable_thinking=disable_thinking,
         )
         # Two pre-bound LLM variants — no thinking config scattered across files.
         # routing_llm: minimal thinking for classification + summarization tasks.
-        # worker_llm:  low thinking for tool-augmented reasoning (write/read/sql).
+        # worker_llm:  minimal thinking for tool-augmented reasoning (write/read/sql).
         self._routing_llm = build_chat_llm(
             **_llm_kwargs, thinking_level=thinking_level_routing
         )
@@ -145,7 +155,6 @@ class SupervisorAgent:
 
         self._graph = self._build_graph()
 
-    # ------------------------------------------------------------------
     # Sheet list cache helpers
     # ------------------------------------------------------------------
 
