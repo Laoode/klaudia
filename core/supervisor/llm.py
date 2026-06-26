@@ -1,29 +1,8 @@
-"""LLM factory — selects the chat backend by provider.
+"""Provider-agnostic chat-LLM factory for the agentic stack.
 
-Two providers are supported behind one factory so the rest of the agentic
-graph (supervisor, routers, react workers) stays provider-agnostic:
-
-    provider="google"  → ChatGoogleGenerativeAI
-        Dual transport: pass use_vertexai=True (+ project/location) to route via
-        GCP Vertex AI, otherwise the Gemini Developer API + google_api_key.
-        Thinking is controlled with thinking_level (Gemini 3 generation_config).
-
-    provider="openai"  → ChatOpenAI pointed at an OpenAI-compatible server
-        (our local vLLM running Qwen). thinking_level is ignored; thinking is
-        disabled via extra_body chat_template_kwargs instead (see below).
-
-thinking_level (Gemini only): if provided, binds a generation_config so all
-downstream calls (structured output, ainvoke, …) use that thinking budget.
-None = leave the model at its default (currently "high" for gemini-3-*).
-
-disable_thinking (OpenAI/vLLM only): when True, every request carries
-extra_body={"chat_template_kwargs": {"enable_thinking": False}}. This is the
-in-code equivalent of Qwen's `/no_think` soft switch — it forces thinking off
-regardless of how the vLLM server was started, without mutating any prompt.
-
-Callers build two variants:
-    routing_llm = build_chat_llm(..., thinking_level="minimal")  # router, team_supervisor, _emit_final_reply
-    worker_llm  = build_chat_llm(..., thinking_level="low")      # write_agent, read_agent, sql_agent
+One factory keeps the supervisor, routers, and react workers ignorant of which
+backend they talk to. See docs/MODELS.md for the full provider matrix, the
+per-provider thinking-mode mechanics, and the DeepSeek caveats.
 """
 from __future__ import annotations
 
@@ -31,23 +10,40 @@ from typing import Any, Optional
 
 from langchain_core.language_models.chat_models import BaseChatModel
 
-# Gemini 3 models expose thinking_level control via generation_config.
-# Models that don't support it (e.g. older 1.x/2.x) will reject this kwarg;
-# build_chat_llm skips binding when thinking_level is None so legacy model
-# strings are unaffected.
-_VALID_THINKING_LEVELS = {"none", "minimal", "low", "medium", "high"}
+# Provider buckets. "openai" is kept as a back-compat alias for "vllm".
+_GEMINI_PROVIDERS = frozenset({"google", "gemini", "vertexai"})
+_VLLM_PROVIDERS = frozenset({"vllm", "qwen", "openai"})
+_DEEPSEEK_PROVIDERS = frozenset({"deepseek"})
+_OPENAI_COMPATIBLE = _VLLM_PROVIDERS | _DEEPSEEK_PROVIDERS
 
-# Qwen / vLLM: disable the reasoning trace at the chat-template level. Sent as
-# extra_body so it rides on every request the OpenAI client makes. Mirrors the
-# `/no_think` inline switch but keeps prompts untouched.
-_QWEN_NO_THINK_EXTRA_BODY: dict[str, Any] = {
-    "chat_template_kwargs": {"enable_thinking": False}
-}
+# Gemini 3 thinking budgets (generation_config). Binding is skipped when
+# thinking_level is None, so legacy 1.x/2.x model strings stay unaffected.
+_VALID_THINKING_LEVELS = frozenset(
+    {"none", "minimal", "low", "medium", "high"}
+)
 
-# Placeholder sent when no bearer token is configured. The OpenAI client rejects
-# an empty api_key, but a self-hosted vLLM started without --api-key ignores the
-# value entirely. Swap in a real token via LLM_OPENAI_API_KEY when vLLM enforces auth.
+# OpenAI client rejects an empty api_key; a self-hosted vLLM started without
+# --api-key ignores the value, so this placeholder is safe there.
 _VLLM_PLACEHOLDER_KEY = "EMPTY"
+
+
+def _openai_thinking_extra_body(
+    provider: str, disable_thinking: bool
+) -> Optional[dict[str, Any]]:
+    """Return the provider-specific extra_body to turn reasoning off.
+
+    Each OpenAI-compatible server toggles thinking differently:
+        deepseek → {"thinking": {"type": "disabled"}}
+        vllm/qwen → {"chat_template_kwargs": {"enable_thinking": False}}  (/no_think)
+    None means "leave the server default untouched".
+    """
+    if not disable_thinking:
+        return None
+    if provider in _DEEPSEEK_PROVIDERS:
+        return {"thinking": {"type": "disabled"}}
+    if provider in _VLLM_PROVIDERS:
+        return {"chat_template_kwargs": {"enable_thinking": False}}
+    return None
 
 
 def build_chat_llm(
@@ -67,20 +63,21 @@ def build_chat_llm(
     """Build a chat model for the configured provider.
 
     Args:
-        provider: "google" (Gemini) or "openai" (OpenAI-compatible / vLLM).
+        provider: "google" (Gemini), "vllm" (Qwen on vLLM), or "deepseek".
         thinking_level: Gemini-only thinking budget. None = model default.
-        disable_thinking: OpenAI/vLLM-only. Force thinking off via extra_body.
+        disable_thinking: OpenAI-compatible only. Force thinking off via extra_body.
     """
     normalized = (provider or "google").strip().lower()
-    if normalized == "openai":
+    if normalized in _OPENAI_COMPATIBLE:
         return _build_openai_llm(
             model=model,
+            provider=normalized,
             temperature=temperature,
             base_url=openai_base_url,
             api_key=openai_api_key,
             disable_thinking=disable_thinking,
         )
-    if normalized in ("google", "gemini", "vertexai"):
+    if normalized in _GEMINI_PROVIDERS:
         return _build_gemini_llm(
             model=model,
             temperature=temperature,
@@ -91,33 +88,35 @@ def build_chat_llm(
             thinking_level=thinking_level,
         )
     raise ValueError(
-        f"Unknown MODEL_PROVIDER={provider!r}. Valid values: 'google', 'openai'."
+        f"Unknown MODEL_PROVIDER={provider!r}. "
+        "Valid values: 'google', 'vllm', 'deepseek'."
     )
 
 
 def _build_openai_llm(
     *,
     model: str,
+    provider: str,
     temperature: float,
     base_url: Optional[str],
     api_key: Optional[str],
     disable_thinking: bool,
 ) -> BaseChatModel:
-    """Build a ChatOpenAI bound to an OpenAI-compatible endpoint (vLLM)."""
+    """Build a ChatOpenAI bound to an OpenAI-compatible endpoint."""
     from langchain_openai import ChatOpenAI
 
     if not base_url:
         raise ValueError(
-            "MODEL_PROVIDER=openai requires LLM_ENDPOINT (the vLLM /v1 base URL)."
+            f"MODEL_PROVIDER={provider} requires a base URL "
+            "(DEEPSEEK_BASE_URL or VLLM_LLM_ENDPOINT)."
         )
 
-    extra_body = dict(_QWEN_NO_THINK_EXTRA_BODY) if disable_thinking else None
     return ChatOpenAI(
         model=model,
         base_url=base_url,
         api_key=api_key or _VLLM_PLACEHOLDER_KEY,
         temperature=temperature,
-        extra_body=extra_body,
+        extra_body=_openai_thinking_extra_body(provider, disable_thinking),
     )
 
 
@@ -167,26 +166,31 @@ def _build_gemini_llm(
     return llm
 
 
-def _is_openai_llm(llm: Any) -> bool:
-    """True if llm is (or wraps) a ChatOpenAI instance.
-
-    Unwraps RunnableBinding layers (.bind()/.with_config()) so the check holds
-    even after the model has been decorated.
-    """
+def _unwrap(llm: Any) -> Any:
+    """Strip RunnableBinding layers (.bind()/.with_config()) to the base model."""
     base = llm
     while hasattr(base, "bound"):
         base = base.bound
-    return base.__class__.__name__ == "ChatOpenAI"
+    return base
+
+
+def _is_openai_llm(llm: Any) -> bool:
+    """True if llm is (or wraps) a ChatOpenAI instance."""
+    return _unwrap(llm).__class__.__name__ == "ChatOpenAI"
 
 
 def with_structured(llm: BaseChatModel, schema: Any):
     """Provider-agnostic structured output.
 
-    Gemini uses its native structured-output path. OpenAI-compatible servers
-    (vLLM) use method="json_schema" so the constraint rides on response_format /
-    guided decoding instead of tool-calling — this keeps the routers working
-    even when the vLLM server is started without --enable-auto-tool-choice.
+    Gemini uses its native path. For OpenAI-compatible servers the method is
+    picked per backend: DeepSeek goes through function-calling (its reliable
+    tool path), vLLM/Qwen through json_schema so the constraint rides on guided
+    decoding even when the server lacks --enable-auto-tool-choice.
     """
-    if _is_openai_llm(llm):
-        return llm.with_structured_output(schema, method="json_schema")
-    return llm.with_structured_output(schema)
+    if not _is_openai_llm(llm):
+        return llm.with_structured_output(schema)
+
+    base = _unwrap(llm)
+    model_name = (getattr(base, "model_name", None) or getattr(base, "model", "") or "").lower()
+    method = "function_calling" if "deepseek" in model_name else "json_schema"
+    return llm.with_structured_output(schema, method=method)
