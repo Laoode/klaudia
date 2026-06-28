@@ -36,7 +36,17 @@ WORK_DONE_MARKERS = ("[WRITE_DONE]", "[SHEET_DONE]", "[READ_DONE]")
 
 
 class TeamRouter(TypedDict):
-    next: str
+    # Constrained to the team's own namespace. Guided decoding (vLLM json_schema)
+    # / function-calling (DeepSeek) then makes it impossible for the routing LLM
+    # to echo a parent-layer name like "data_entry_team" or "sql_agent".
+    next: Literal["read_agent", "sheet_agent", "write_agent", "FINISH"]
+
+
+def _is_system_message(m: Any) -> bool:
+    """True for both dict {"role": "system"} turns and SystemMessage objects."""
+    if isinstance(m, dict):
+        return m.get("role") == "system"
+    return getattr(m, "type", None) == "system"
 
 
 def _normalize_route(raw: str) -> str:
@@ -148,9 +158,17 @@ def make_data_entry_team(
                 )
                 return Command(goto=END, update={"next": "FINISH"})
 
+        # Strip the parent persona system prompt before the routing call. It
+        # carries the top-level "route to data_entry_team / sql_agent"
+        # vocabulary, which primes this sub-router to echo the parent namespace
+        # instead of choosing a worker. The classifier only needs the
+        # conversation turns + its own DATA_ENTRY_SUPERVISOR_PROMPT; the sheet
+        # list / date context the workers rely on stays untouched (workers still
+        # receive the full state).
+        convo = [m for m in state["messages"] if not _is_system_message(m)]
         messages = [
             {"role": "system", "content": DATA_ENTRY_SUPERVISOR_PROMPT}
-        ] + state["messages"]
+        ] + convo
         # routing_llm is pre-bound with minimal thinking — classification task only.
         response = await with_structured(routing_llm, TeamRouter).ainvoke(messages)
         goto = _normalize_route(response["next"])

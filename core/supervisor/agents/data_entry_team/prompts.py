@@ -93,6 +93,7 @@ _CLARIFY_RULE = (
     "- A value is genuinely ambiguous (e.g. '25 ribu atau 25 juta?') — phrasing "
     "you can reasonably parse is NOT ambiguous.\n"
     "- The user references data you cannot locate after a list_sheets / read.\n"
+    "- The user requests a point of no return (Mass-deletion request must not execute silently) but you can verify the sheet/table/data exists and ask for confirmation first.\n"
     "When [CLARIFY] is WRONG:\n"
     "- The task is just compound (multi-step). Compose the primitives yourself "
     "instead of asking the user to break it down.\n"
