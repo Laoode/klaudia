@@ -2,9 +2,32 @@ import logging
 
 from langchain_core.tools import BaseTool
 
+from klaudia.core.supervisor.tools.coordinates import annotate_sheet_output
 from klaudia.interfaces.tool_registry import MCPToolRegistry
 
 logger = logging.getLogger(__name__)
+
+# Read tools whose tabular output must be coordinate-annotated so the model
+# never has to compute write targets (e.g. "B5") by counting rows itself.
+_COORD_READ_TOOLS = {"tool_get_sheet_data", "tool_get_multiple_sheet_data"}
+
+
+def _with_coordinates(tool: BaseTool) -> BaseTool:
+    """Return a copy of a read tool whose output is row/column annotated.
+
+    Other tools pass through untouched. Uses model_copy to swap only the
+    coroutine, preserving the original name/description/args_schema exactly.
+    """
+    if tool.name not in _COORD_READ_TOOLS:
+        return tool
+    inner = tool.coroutine
+    if inner is None:
+        return tool
+
+    async def _call(**kwargs: object) -> str:
+        return annotate_sheet_output(await inner(**kwargs))
+
+    return tool.model_copy(update={"coroutine": _call})
 
 
 def get_sql_tools(registry: MCPToolRegistry) -> list[BaseTool]:
@@ -40,7 +63,7 @@ def get_read_tools(registry: MCPToolRegistry) -> list[BaseTool]:
         "tool_get_spreadsheet_info",
         "tool_get_multiple_sheet_data",
     }
-    return [t for t in registry.tools if t.name in allowed]
+    return [_with_coordinates(t) for t in registry.tools if t.name in allowed]
 
 
 def get_sheet_tools(registry: MCPToolRegistry) -> list[BaseTool]:
@@ -77,4 +100,4 @@ def get_write_tools(registry: MCPToolRegistry) -> list[BaseTool]:
         "tool_add_columns",
         "tool_clear_range",
     }
-    return [t for t in registry.tools if t.name in allowed]
+    return [_with_coordinates(t) for t in registry.tools if t.name in allowed]
