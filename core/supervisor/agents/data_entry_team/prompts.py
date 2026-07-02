@@ -87,13 +87,21 @@ _OUTPUT_MARKER_RULE = (
 )
 
 _CLARIFY_RULE = (
-    "When [CLARIFY] is appropriate (use sparingly):\n"
+    "When [CLARIFY] is appropriate ('sparingly' means don't ask about things "
+    "you can reasonably infer; it does NOT mean guess on a genuinely ambiguous "
+    "financial amount or a destructive action; those always warrant asking):\n"
     "- The target sheet does not exist and you cannot proceed without creating "
     "it (sheet creation is sheet_agent's job).\n"
-    "- A value is genuinely ambiguous (e.g. '25 ribu atau 25 juta?'); phrasing "
-    "you can reasonably parse is NOT ambiguous.\n"
+    "- If the user gave a BARE number"
+    "and that number's order of magnitude is 10x or more smaller than the "
+    "existing values in that same column, the instruction is genuinely "
+    "ambiguous. Do NOT write it literally. Emit [CLARIFY] naming the current "
+    "value, the literal number as typed, and asking which magnitude the user means.\n"
     "- The user references data you cannot locate after a list_sheets / read.\n"
     "- The user requests a point of no return (Mass-deletion request must not execute silently) but you can verify the sheet/table/data exists and ask for confirmation first.\n"
+    "- 'Use [CLARIFY] sparingly' never licenses guessing here. Writing the "
+    "wrong magnitude into a ledger or summary is unrecoverable once "
+    "overwritten; an unnecessary clarifying question costs one extra turn.\n"
     "When [CLARIFY] is WRONG:\n"
     "- The task is just compound (multi-step). Compose the primitives yourself "
     "instead of asking the user to break it down.\n"
@@ -287,10 +295,9 @@ FINANCIAL & TRANSACTION DATA ENTRY RULES (Applies to Text Updates & Receipt Extr
    - Step A: Append the individual item rows to the respective ledger ('sales' or 'purchases').
      - Format: Numbers must be plain integers/floats (no 'Rp' or dots like '15.000' inside the payload; write as 15000).
      - Date: Use TODAY's date from the system prompt unless explicitly stated otherwise.
-   - Step B: Recalculate and update 'budgeting summary'.
+   - Step B: Recalculate and update 'budgeting summary'/'total summary'/ etc...
      - Ensure total operating costs and net profits match mathematical laws blindly.
-     - if add/update/remove about sales -> recalculate of sales revenue, total profit, and net profit in the summary sheet.
-     - if add/update/remove about purchases -> recalculate of total purchases, cost of goods sold, total cost, and net profit in the summary sheet.
+     - if add/update/remove about purchases sheet/table-> recalculate of total purchases in the summary sheet or other related tables to each other.
 
 {_DEFAULT_SHEET_RULE}
 
