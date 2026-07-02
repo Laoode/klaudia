@@ -67,12 +67,21 @@ def _iter_json_objects(raw: str) -> Iterator[dict]:
 
 def _render_sheet(obj: dict[str, Any]) -> str | None:
     """Render one sheet object into a coordinate-annotated text block, or None
-    if it carries no tabular ``data`` to annotate."""
+    if it carries no tabular rows to annotate.
+
+    Two MCP shapes must both be handled — they use different keys:
+      * tool_get_multiple_sheet_data → {"sheet"/query…, "data": [[…]]}
+      * tool_get_sheet_data (single) → {"range": "Jun", "values": [[…]]}
+    Missing the ``values`` alias silently no-ops annotation on the single-sheet
+    read the write agent grounds updates on, so it counts rows by hand and
+    writes one row off (corrupting a neighbouring record)."""
     data = obj.get("data")
+    if data is None:
+        data = obj.get("values")
     if not isinstance(data, list) or not data:
         return None
 
-    sheet = obj.get("sheet") or obj.get("title") or "?"
+    sheet = obj.get("sheet") or obj.get("title") or obj.get("range") or "?"
     header = data[0] if isinstance(data[0], list) else [data[0]]
     legend = " | ".join(
         f"{col_letter(c)}={'' if v is None else v}" for c, v in enumerate(header)
