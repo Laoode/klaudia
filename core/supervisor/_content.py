@@ -63,3 +63,37 @@ def strip_internal_markers(text: str) -> str:
         return ""
     cleaned = _INTERNAL_MARKER_TOKEN_RE.sub("", text)
     return "\n".join(l.rstrip() for l in cleaned.splitlines() if l.strip()).strip()
+
+
+# Internal plumbing identifiers that must never surface in user-facing text.
+# A worker occasionally echoes one of these straight from its own system prompt
+# (e.g. sql_agent saying "SESSION FILES masih kosong"). That is a leak on its
+# own, AND when the final-reply LLM (which carries the anti-leak persona) sees
+# the phrase it misreads it as a prompt-extraction attempt and refuses outright.
+# Scrubbing the worker text before it reaches the user or the final LLM closes
+# both failure modes. Applied only to worker output, so legitimate financial
+# content is never touched.
+_INTERNAL_PHRASE_SUBS = (
+    (re.compile(r"\bSESSION FILES\b", re.IGNORECASE), "file yang diupload"),
+    (re.compile(r"\bAVAILABLE GOOGLE SHEETS\b", re.IGNORECASE), "daftar sheet"),
+    (re.compile(r"\bCURRENT SESSION ID\b", re.IGNORECASE), "sesi ini"),
+)
+_INTERNAL_TOKEN_RE = re.compile(
+    r"\b(?:data_entry_team|sql_agent|read_agent|write_agent|sheet_agent"
+    r"|session_files|available_sheets|tool_[a-z_]+)\b",
+    re.IGNORECASE,
+)
+_MULTISPACE_RE = re.compile(r"[ \t]{2,}")
+
+
+def scrub_internal_identifiers(text: str) -> str:
+    """Neutralize internal field names, agent names, and tool names so they
+    never reach the user or the final-reply LLM. Conservative: only known
+    plumbing tokens are touched; everything else passes through verbatim."""
+    if not text:
+        return ""
+    out = text
+    for pattern, replacement in _INTERNAL_PHRASE_SUBS:
+        out = pattern.sub(replacement, out)
+    out = _INTERNAL_TOKEN_RE.sub("sistem", out)
+    return _MULTISPACE_RE.sub(" ", out)

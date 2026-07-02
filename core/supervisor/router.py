@@ -7,7 +7,11 @@ from langgraph.graph import END
 from langgraph.types import Command
 from typing_extensions import TypedDict
 
-from klaudia.core.supervisor._content import coerce_to_text, strip_internal_markers
+from klaudia.core.supervisor._content import (
+    coerce_to_text,
+    scrub_internal_identifiers,
+    strip_internal_markers,
+)
 from klaudia.core.supervisor.llm import with_structured
 from klaudia.core.supervisor.prompts import SUPERVISOR_ROUTING_PROMPT
 from klaudia.core.supervisor.state import SupervisorState
@@ -51,7 +55,9 @@ def _prepare_finish_messages(state_messages: list[Any]) -> list[Any]:
     for msg in state_messages:
         name = getattr(msg, "name", None)
         if name in _WORKER_NAMES:
-            text = strip_internal_markers(coerce_to_text(getattr(msg, "content", "")))
+            text = scrub_internal_identifiers(
+                strip_internal_markers(coerce_to_text(getattr(msg, "content", "")))
+            )
             if not text:
                 # Nothing left after stripping — drop the message entirely
                 # rather than feed an empty turn into Gemini.
@@ -92,7 +98,7 @@ def make_supervisor_node(llm: BaseChatModel):
             if last_name in _WORKER_NAMES:
                 last_text = coerce_to_text(getattr(last, "content", ""))
                 if any(marker in last_text for marker in _PASSTHROUGH_MARKERS):
-                    clean = strip_internal_markers(last_text)
+                    clean = scrub_internal_identifiers(strip_internal_markers(last_text))
                     if clean:
                         logger.info(
                             f"Supervisor: deterministic FINISH (pass-through from {last_name})"

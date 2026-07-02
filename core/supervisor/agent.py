@@ -167,7 +167,7 @@ class SupervisorAgent:
         """
         self._sheets_fetched_at = 0.0
 
-    async def get_available_sheets(self, ttl: float = 60.0) -> str:
+    async def get_available_sheets(self, ttl: float = 10.0) -> str:
         """Return a formatted sheet list, refreshed at most every ttl seconds.
 
         Python calls tool_list_sheets directly — no LLM involvement, no agent

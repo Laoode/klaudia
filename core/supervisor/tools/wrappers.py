@@ -20,12 +20,16 @@ def _with_coordinates(tool: BaseTool) -> BaseTool:
     """
     if tool.name not in _COORD_READ_TOOLS:
         return tool
-    inner = tool.coroutine
-    if inner is None:
+    if tool.coroutine is None:
         return tool
+    src = tool  # original registry tool; its .coroutine may be re-patched later
 
     async def _call(**kwargs: object) -> str:
-        return annotate_sheet_output(await inner(**kwargs))
+        # Resolve src.coroutine at CALL time, not build time, so anything that
+        # re-wraps the original tool's coroutine after the graph is built (the
+        # E2E MCPSpy, tracing) still observes the invocation. Capturing it in a
+        # closure here would make those wrappers invisible.
+        return annotate_sheet_output(await src.coroutine(**kwargs))
 
     return tool.model_copy(update={"coroutine": _call})
 
