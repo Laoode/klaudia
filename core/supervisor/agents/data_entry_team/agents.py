@@ -9,7 +9,7 @@ from langgraph.types import Command
 from typing_extensions import TypedDict
 
 from klaudia.core.supervisor._content import coerce_to_text
-from klaudia.core.supervisor.llm import with_structured
+from klaudia.core.supervisor.llm import ainvoke_route, with_structured
 from klaudia.core.supervisor.agents.data_entry_team.prompts import (
     DATA_ENTRY_SUPERVISOR_PROMPT,
     READ_AGENT_PROMPT,
@@ -170,7 +170,13 @@ def make_data_entry_team(
             {"role": "system", "content": DATA_ENTRY_SUPERVISOR_PROMPT}
         ] + convo
         # routing_llm is pre-bound with minimal thinking — classification task only.
-        response = await with_structured(routing_llm, TeamRouter).ainvoke(messages)
+        response = await ainvoke_route(with_structured(routing_llm, TeamRouter), messages)
+        if response is None:
+            # No parseable route (malformed tool-call JSON) even after retry.
+            # End the sub-graph cleanly so the parent can summarize, rather than
+            # crashing on response["next"].
+            logger.warning("Team supervisor: no valid structured route; FINISH fallback")
+            return Command(goto=END, update={"next": "FINISH"})
         goto = _normalize_route(response["next"])
         if goto == "FINISH":
             goto = END

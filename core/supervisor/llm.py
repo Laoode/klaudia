@@ -6,9 +6,12 @@ per-provider thinking-mode mechanics, and the DeepSeek caveats.
 """
 from __future__ import annotations
 
+import logging
 from typing import Any, Optional
 
 from langchain_core.language_models.chat_models import BaseChatModel
+
+logger = logging.getLogger(__name__)
 
 # Provider buckets. "openai" is kept as a back-compat alias for "vllm".
 _GEMINI_PROVIDERS = frozenset({"google", "gemini", "vertexai"})
@@ -194,3 +197,30 @@ def with_structured(llm: BaseChatModel, schema: Any):
     model_name = (getattr(base, "model_name", None) or getattr(base, "model", "") or "").lower()
     method = "function_calling" if "deepseek" in model_name else "json_schema"
     return llm.with_structured_output(schema, method=method)
+
+
+async def ainvoke_route(chain: Any, messages: Any, *, retries: int = 1) -> Optional[dict]:
+    """Invoke a structured-output router chain, tolerating malformed LLM output.
+
+    OpenAI-compatible backends (notably DeepSeek function-calling) occasionally
+    emit tool-call arguments that are not valid JSON — e.g. a long multi-line
+    `response` value with unescaped newlines, or a truncated string. LangChain's
+    tool parser then yields no object and `.ainvoke` returns None, which crashes
+    any caller doing `result["next"]`. Resample up to `retries` extra times
+    (temperature > 0 makes a retry a real second chance), then return None so the
+    caller falls back deterministically instead of raising and killing the turn.
+    """
+    result: Any = None
+    for attempt in range(retries + 1):
+        try:
+            result = await chain.ainvoke(messages)
+        except Exception as exc:  # parser/transport failure — treat as no result
+            logger.warning("structured route invoke failed (attempt %d): %s", attempt + 1, exc)
+            result = None
+        if isinstance(result, dict):
+            return result
+        if attempt < retries:
+            logger.warning(
+                "structured route returned no valid object (attempt %d); retrying", attempt + 1
+            )
+    return None

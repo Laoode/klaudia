@@ -12,7 +12,7 @@ from klaudia.core.supervisor._content import (
     scrub_internal_identifiers,
     strip_internal_markers,
 )
-from klaudia.core.supervisor.llm import with_structured
+from klaudia.core.supervisor.llm import ainvoke_route, with_structured
 from klaudia.core.supervisor.prompts import SUPERVISOR_ROUTING_PROMPT
 from klaudia.core.supervisor.state import SupervisorState
 
@@ -117,7 +117,13 @@ def make_supervisor_node(llm: BaseChatModel):
             with_structured(llm, RouterWithResponse)
             .with_config({"tags": ["nostream"]})
         )
-        result = await combined_llm.ainvoke(messages)
+        result = await ainvoke_route(combined_llm, messages)
+        if result is None:
+            # LLM produced no parseable routing object (e.g. malformed DeepSeek
+            # tool-call JSON) even after retry. Degrade to a plain user-facing
+            # reply instead of crashing the whole request.
+            logger.warning("Supervisor: no valid structured route; FINISH fallback")
+            return await _emit_final_reply(state_messages)
         goto = result.get("next", "FINISH")
         inline_response = (result.get("response") or "").strip()
 
