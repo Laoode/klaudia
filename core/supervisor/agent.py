@@ -245,11 +245,18 @@ class SupervisorAgent:
         extraction_data: dict[str, Any] | None = None,
         session_id: int | None = None,
         user_id: int | None = None,
+        sheets_context: str = "",
+        files_context: str = "",
+        date_context: str = "",
     ) -> AgentResponse:
         state = {
             "messages": messages,
             "extraction_data": extraction_data,
             "session_id": session_id or 0,
+            "sheets_context": sheets_context,
+            "files_context": files_context,
+            "date_context": date_context,
+            "pending_worker": None,
         }
         config = self._graph_config(
             session_id, user_id, run_name="klaudia.supervisor.invoke"
@@ -279,11 +286,18 @@ class SupervisorAgent:
         extraction_data: dict[str, Any] | None = None,
         session_id: int | None = None,
         user_id: int | None = None,
+        sheets_context: str = "",
+        files_context: str = "",
+        date_context: str = "",
     ) -> AsyncIterator[dict[str, Any]]:
         state = {
             "messages": messages,
             "extraction_data": extraction_data,
             "session_id": session_id or 0,
+            "sheets_context": sheets_context,
+            "files_context": files_context,
+            "date_context": date_context,
+            "pending_worker": None,
         }
 
         final_chunks: list[str] = []

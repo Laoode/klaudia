@@ -7,6 +7,7 @@ from langgraph.prebuilt import create_react_agent
 from langgraph.types import Command
 
 from klaudia.core.supervisor._content import coerce_to_text
+from klaudia.core.supervisor._context import build_sql_system, swap_system
 from klaudia.core.supervisor.agents.sql_agent.prompts import SQL_AGENT_PROMPT
 from klaudia.core.supervisor.state import SupervisorState
 from klaudia.interfaces.tool_registry import MCPToolRegistry
@@ -21,7 +22,10 @@ def make_sql_agent_node(llm: BaseChatModel, mcp_sqlite: MCPToolRegistry):
     agent = create_react_agent(llm, tools=tools, prompt=SQL_AGENT_PROMPT)
 
     async def sql_agent_node(state: SupervisorState) -> Command[Literal["supervisor"]]:
-        result = await agent.ainvoke(state)
+        # Focused context: file list + session id only, no parent persona and no
+        # sheet context (sql_agent never touches Google Sheets).
+        sql_messages = swap_system(state["messages"], build_sql_system(state))
+        result = await agent.ainvoke({**state, "messages": sql_messages})
         return Command(
             update={
                 "messages": [
