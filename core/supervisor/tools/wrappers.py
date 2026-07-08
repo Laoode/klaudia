@@ -71,13 +71,20 @@ def get_read_tools(registry: MCPToolRegistry) -> list[BaseTool]:
 
 
 def get_sheet_tools(registry: MCPToolRegistry) -> list[BaseTool]:
-    """Get sheet management tools for Sheet Agent."""
+    """Get sheet management tools for Sheet Agent.
+
+    STRUCTURE ONLY — deliberately excludes tool_batch_update. batch_update is a
+    low-level spreadsheets.batchUpdate that can also write cell VALUES, and the
+    model would use it to populate headers/data (overstepping write_agent's job
+    and making the parked write step a redundant no-op). Cell population is
+    write_agent's responsibility: sheet_agent only creates/renames/copies/deletes
+    the tab, then stops. Structural CRUD is fully covered by the four tools below.
+    """
     allowed = {
         "tool_create_sheet",
         "tool_rename_sheet",
         "tool_copy_sheet",
         "tool_delete_sheet",
-        "tool_batch_update",
     }
     return [t for t in registry.tools if t.name in allowed]
 

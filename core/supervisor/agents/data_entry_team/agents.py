@@ -1,5 +1,5 @@
 import logging
-from typing import Any, Callable, Literal, Optional
+from typing import Callable, Literal, Optional
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import HumanMessage, ToolMessage
@@ -9,6 +9,12 @@ from langgraph.types import Command
 from typing_extensions import TypedDict
 
 from klaudia.core.supervisor._content import coerce_to_text
+from klaudia.core.supervisor._context import (
+    build_team_classifier_context,
+    build_worker_system,
+    is_system_message,
+    swap_system,
+)
 from klaudia.core.supervisor.llm import ainvoke_route, with_structured
 from klaudia.core.supervisor.agents.data_entry_team.prompts import (
     DATA_ENTRY_SUPERVISOR_PROMPT,
@@ -42,11 +48,49 @@ class TeamRouter(TypedDict):
     next: Literal["read_agent", "sheet_agent", "write_agent", "FINISH"]
 
 
-def _is_system_message(m: Any) -> bool:
-    """True for both dict {"role": "system"} turns and SystemMessage objects."""
-    if isinstance(m, dict):
-        return m.get("role") == "system"
-    return getattr(m, "type", None) == "system"
+# Deterministic compound-intent detection. Unambiguous verb sets only: this is a
+# SAFE SUBSET that forces the correct sheet_agent->write_agent ordering for the
+# common "buatkan sheet X, masukkan ini" case. Anything it misses still falls to
+# the sheet-aware LLM classifier below, so false negatives are harmless.
+_CREATE_SHEET_VERBS = ("buat", "bikin", "create")
+_CREATE_SHEET_PHRASES = ("sheet baru", "new sheet", "new tab", "tab baru")
+_SHEET_WORDS = ("sheet", "tab")
+# Data-insertion verbs only (excludes ambiguous "tambah", which also means
+# "tambah sheet" = create, not write).
+_WRITE_VERBS = (
+    "masuk", "input", "catat", "isi", "record", "insert", "simpan", "entri", "entry",
+)
+
+
+def _has_create_sheet_intent(text: str) -> bool:
+    t = text.lower()
+    if any(p in t for p in _CREATE_SHEET_PHRASES):
+        return True
+    return any(v in t for v in _CREATE_SHEET_VERBS) and any(w in t for w in _SHEET_WORDS)
+
+
+def _has_write_intent(text: str) -> bool:
+    t = text.lower()
+    return any(v in t for v in _WRITE_VERBS)
+
+
+def _latest_user_text(messages: list) -> str:
+    """The triggering user instruction: the most recent human turn that is
+    neither a worker reply nor the injected [Extraction Result] block."""
+    for m in reversed(messages):
+        if getattr(m, "name", None) in MEMBERS:
+            continue
+        if is_system_message(m):
+            continue
+        role = m.get("role") if isinstance(m, dict) else getattr(m, "type", None)
+        if role not in ("user", "human"):
+            continue
+        content = m.get("content") if isinstance(m, dict) else getattr(m, "content", "")
+        text = coerce_to_text(content)
+        if text.startswith("[Extraction Result]"):
+            continue
+        return text
+    return ""
 
 
 def _normalize_route(raw: str) -> str:
@@ -147,28 +191,57 @@ def make_data_entry_team(
         state: SupervisorState,
     ) -> Command[Literal["read_agent", "sheet_agent", "write_agent", "__end__"]]:
         msgs = state.get("messages") or []
+        pending = state.get("pending_worker")
+
+        # 1. A worker just reported back.
         if msgs:
             last = msgs[-1]
             last_name = getattr(last, "name", None)
             last_content = coerce_to_text(getattr(last, "content", ""))
             if last_name in MEMBERS and _is_terminal_marker(last_content):
+                # Compound sequencer: the structural step of a create-then-write
+                # just landed. Run the parked worker instead of FINISHing, so the
+                # data actually gets written into the sheet we just created.
+                if pending in MEMBERS and "[SHEET_DONE]" in last_content:
+                    logger.info(
+                        "Team supervisor: [SHEET_DONE] received, routing parked %s",
+                        pending,
+                    )
+                    return Command(
+                        goto=pending, update={"next": pending, "pending_worker": None}
+                    )
                 logger.info(
                     "Team supervisor: deterministic FINISH (terminal marker from %s)",
                     last_name,
                 )
                 return Command(goto=END, update={"next": "FINISH"})
 
-        # Strip the parent persona system prompt before the routing call. It
-        # carries the top-level "route to data_entry_team / sql_agent"
-        # vocabulary, which primes this sub-router to echo the parent namespace
-        # instead of choosing a worker. The classifier only needs the
-        # conversation turns + its own DATA_ENTRY_SUPERVISOR_PROMPT; the sheet
-        # list / date context the workers rely on stays untouched (workers still
-        # receive the full state).
-        convo = [m for m in state["messages"] if not _is_system_message(m)]
-        messages = [
-            {"role": "system", "content": DATA_ENTRY_SUPERVISOR_PROMPT}
-        ] + convo
+        # 2. First dispatch this invocation (no worker has run yet).
+        no_worker_ran = not any(getattr(m, "name", None) in MEMBERS for m in msgs)
+        if no_worker_ran:
+            user_text = _latest_user_text(msgs)
+            # Deterministic compound: "buatkan sheet X, masukkan ini" -> the sheet
+            # must exist before the write. Force sheet_agent first and park the
+            # write. Ordering only; the workers resolve the actual sheet name.
+            if _has_create_sheet_intent(user_text) and _has_write_intent(user_text):
+                logger.info(
+                    "Team supervisor: compound create+write detected -> sheet_agent "
+                    "first, parking write_agent"
+                )
+                return Command(
+                    goto="sheet_agent",
+                    update={"next": "sheet_agent", "pending_worker": "write_agent"},
+                )
+
+        # 3. LLM classification. Strip the parent persona (it primes the sub-router
+        # to echo the parent namespace) but ADD the live sheet list, so the
+        # classifier knows which sheets exist and can order create-then-write for
+        # implicit cases the deterministic step above does not catch.
+        convo = [m for m in msgs if not is_system_message(m)]
+        classifier_prompt = build_team_classifier_context(
+            DATA_ENTRY_SUPERVISOR_PROMPT, state.get("sheets_context", "")
+        )
+        messages = [{"role": "system", "content": classifier_prompt}] + convo
         # routing_llm is pre-bound with minimal thinking — classification task only.
         response = await ainvoke_route(with_structured(routing_llm, TeamRouter), messages)
         if response is None:
@@ -208,7 +281,20 @@ def make_data_entry_team_node(
     async def data_entry_team_node(
         state: SupervisorState,
     ) -> Command[Literal["supervisor"]]:
-        response = await team_graph.ainvoke({"messages": state["messages"]})
+        # Replace the parent persona with a lean worker context (voice card +
+        # sheet list + date). Workers no longer inherit the 200-line persona,
+        # routing reference, or session-file context they never use.
+        worker_system = build_worker_system(state)
+        team_messages = swap_system(state["messages"], worker_system)
+        response = await team_graph.ainvoke(
+            {
+                "messages": team_messages,
+                "sheets_context": state.get("sheets_context", ""),
+                "date_context": state.get("date_context", ""),
+                "session_id": state.get("session_id", 0),
+                "pending_worker": None,
+            }
+        )
         last_msg = response["messages"][-1]
         last_name = getattr(last_msg, "name", None)
         last_content = coerce_to_text(getattr(last_msg, "content", ""))
@@ -230,8 +316,14 @@ def make_data_entry_team_node(
                 "Mohon jelaskan lebih detail apa yang ingin dicatat dan ke sheet mana."
             )
 
-        # Cache invalidation: structural sheet change detected.
-        if on_sheet_mutation is not None and "[SHEET_DONE]" in last_content:
+        # Cache invalidation: structural sheet change detected anywhere in the
+        # run. Scan ALL messages, not just the last: in a compound create-then-
+        # write the final message is [WRITE_DONE] and the [SHEET_DONE] sits
+        # earlier, but the new sheet still must show up in the next turn's list.
+        if on_sheet_mutation is not None and any(
+            "[SHEET_DONE]" in coerce_to_text(getattr(m, "content", ""))
+            for m in response["messages"]
+        ):
             logger.info("Sheet mutation detected — invalidating sheet list cache")
             on_sheet_mutation()
 
