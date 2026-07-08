@@ -53,11 +53,16 @@ _INTERNAL_MARKER_TOKEN_RE = re.compile(
 
 def strip_internal_markers(text: str) -> str:
     """Remove [WRITE_DONE]/[READ_DONE]/[SHEET_DONE]/[CLARIFY] tokens while
-    keeping the human-readable summary the worker emitted next to them.
+    keeping ALL of the human-readable text the worker emitted around them.
 
-    Workers append these markers so the team supervisor's deterministic
-    completion gate can fire without an LLM call. Users must never see the
-    brackets, but the one-line summary IS valid content for them.
+    Workers emit these markers so the team supervisor's deterministic
+    completion gate can fire without an LLM call. This helper only neutralises
+    the bracket tokens; it keeps every surrounding line, because the worker text
+    is used as GROUND TRUTH for the final re-voicing pass (router.py's
+    _emit_final_reply). Dropping any of it would strip figures/tables the
+    persona reply must preserve. Leaked worker scratchpad never reaches the user
+    verbatim anymore: the top supervisor always re-voices worker output through
+    the full Klaudia persona, which rewrites it into a clean user-facing reply.
     """
     if not text:
         return ""
