@@ -4,6 +4,7 @@ One factory keeps the supervisor, routers, and react workers ignorant of which
 backend they talk to. See docs/MODELS.md for the full provider matrix, the
 per-provider thinking-mode mechanics, and the DeepSeek caveats.
 """
+
 from __future__ import annotations
 
 import logging
@@ -21,9 +22,7 @@ _OPENAI_COMPATIBLE = _VLLM_PROVIDERS | _DEEPSEEK_PROVIDERS
 
 # Gemini 3 thinking budgets (generation_config). Binding is skipped when
 # thinking_level is None, so legacy 1.x/2.x model strings stay unaffected.
-_VALID_THINKING_LEVELS = frozenset(
-    {"none", "minimal", "low", "medium", "high"}
-)
+_VALID_THINKING_LEVELS = frozenset({"none", "minimal", "low", "medium", "high"})
 
 # OpenAI client rejects an empty api_key; a self-hosted vLLM started without
 # --api-key ignores the value, so this placeholder is safe there.
@@ -162,9 +161,7 @@ def _build_gemini_llm(
                 f"Invalid thinking_level={thinking_level!r}. "
                 f"Valid values: {sorted(_VALID_THINKING_LEVELS)}"
             )
-        llm = llm.bind(
-            generation_config={"thinking_config": {"thinking_level": level}}
-        )
+        llm = llm.bind(generation_config={"thinking_config": {"thinking_level": level}})
 
     return llm
 
@@ -194,12 +191,16 @@ def with_structured(llm: BaseChatModel, schema: Any):
         return llm.with_structured_output(schema)
 
     base = _unwrap(llm)
-    model_name = (getattr(base, "model_name", None) or getattr(base, "model", "") or "").lower()
+    model_name = (
+        getattr(base, "model_name", None) or getattr(base, "model", "") or ""
+    ).lower()
     method = "function_calling" if "deepseek" in model_name else "json_schema"
     return llm.with_structured_output(schema, method=method)
 
 
-async def ainvoke_route(chain: Any, messages: Any, *, retries: int = 1) -> Optional[dict]:
+async def ainvoke_route(
+    chain: Any, messages: Any, *, retries: int = 1
+) -> Optional[dict]:
     """Invoke a structured-output router chain, tolerating malformed LLM output.
 
     OpenAI-compatible backends (notably DeepSeek function-calling) occasionally
@@ -215,12 +216,15 @@ async def ainvoke_route(chain: Any, messages: Any, *, retries: int = 1) -> Optio
         try:
             result = await chain.ainvoke(messages)
         except Exception as exc:  # parser/transport failure — treat as no result
-            logger.warning("structured route invoke failed (attempt %d): %s", attempt + 1, exc)
+            logger.warning(
+                "structured route invoke failed (attempt %d): %s", attempt + 1, exc
+            )
             result = None
         if isinstance(result, dict):
             return result
         if attempt < retries:
             logger.warning(
-                "structured route returned no valid object (attempt %d); retrying", attempt + 1
+                "structured route returned no valid object (attempt %d); retrying",
+                attempt + 1,
             )
     return None

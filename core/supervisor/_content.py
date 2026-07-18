@@ -67,7 +67,9 @@ def strip_internal_markers(text: str) -> str:
     if not text:
         return ""
     cleaned = _INTERNAL_MARKER_TOKEN_RE.sub("", text)
-    return "\n".join(l.rstrip() for l in cleaned.splitlines() if l.strip()).strip()
+    return "\n".join(
+        line.rstrip() for line in cleaned.splitlines() if line.strip()
+    ).strip()
 
 
 # Internal plumbing identifiers that must never surface in user-facing text.

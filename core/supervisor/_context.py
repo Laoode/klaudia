@@ -69,7 +69,11 @@ def build_sql_system(state: dict) -> str:
     files = state.get("files_context") or "No files uploaded in this session yet."
     session_id = state.get("session_id") or 0
     return "\n\n".join(
-        [KLAUDIA_VOICE_CARD, "SESSION FILES:\n" + files, f"CURRENT SESSION ID: {session_id}"]
+        [
+            KLAUDIA_VOICE_CARD,
+            "SESSION FILES:\n" + files,
+            f"CURRENT SESSION ID: {session_id}",
+        ]
     )
 
 
@@ -81,6 +85,5 @@ def build_team_classifier_context(base_prompt: str, sheets_context: str) -> str:
     return (
         base_prompt
         + "\n\nAVAILABLE SHEETS (index -> title). Treat this as the complete set "
-        "of sheets that currently exist:\n"
-        + sheets_context
+        "of sheets that currently exist:\n" + sheets_context
     )

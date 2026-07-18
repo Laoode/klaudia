@@ -117,11 +117,12 @@ def _prepare_finish_messages(state_messages: list[Any]) -> list[Any]:
 
 class RouterWithResponse(TypedDict):
     """Combined routing + response for initial FINISH decisions.
- 
+
     When `next` is FINISH and no worker has run yet, `response` contains the
     user-facing reply — skipping the second _emit_final_reply LLM call.
     When routing to a worker, `response` must be "".
     """
+
     next: Literal["FINISH", "sql_agent", "data_entry_team"]
     response: str
 
@@ -151,14 +152,19 @@ def make_supervisor_node(llm: BaseChatModel):
                 # phrase the worker asked the USER to type ("ya, hapus semua").
                 # Safety > persona richness for a clarification.
                 if "[CLARIFY]" in last_text:
-                    clean = scrub_internal_identifiers(strip_internal_markers(last_text))
+                    clean = scrub_internal_identifiers(
+                        strip_internal_markers(last_text)
+                    )
                     if clean:
                         logger.info(
                             f"Supervisor: FINISH (clarify pass-through from {last_name})"
                         )
                         return Command(
                             goto=END,
-                            update={"messages": [AIMessage(content=clean)], "next": "FINISH"},
+                            update={
+                                "messages": [AIMessage(content=clean)],
+                                "next": "FINISH",
+                            },
                         )
                 # Completed work ([WRITE_DONE]/[READ_DONE]/[SHEET_DONE]) is a
                 # factual report → re-voice through the full Klaudia persona.
@@ -168,11 +174,12 @@ def make_supervisor_node(llm: BaseChatModel):
                 return await _emit_final_reply(state_messages)
 
         # Combined routing + response call — one LLM hop instead of two for FINISH path
-        messages = [{"role": "system", "content": SUPERVISOR_ROUTING_PROMPT},] + state_messages
+        messages = [
+            {"role": "system", "content": SUPERVISOR_ROUTING_PROMPT},
+        ] + state_messages
 
-        combined_llm = (
-            with_structured(llm, RouterWithResponse)
-            .with_config({"tags": ["nostream"]})
+        combined_llm = with_structured(llm, RouterWithResponse).with_config(
+            {"tags": ["nostream"]}
         )
         result = await ainvoke_route(combined_llm, messages)
         if result is None:
@@ -186,12 +193,19 @@ def make_supervisor_node(llm: BaseChatModel):
 
         if goto not in MEMBERS:
             if inline_response:
-                logger.info(f"Supervisor: FINISH with inline response ({len(inline_response)} chars)")
+                logger.info(
+                    f"Supervisor: FINISH with inline response ({len(inline_response)} chars)"
+                )
                 return Command(
                     goto=END,
-                    update={"messages": [AIMessage(content=inline_response)], "next": "FINISH"},
+                    update={
+                        "messages": [AIMessage(content=inline_response)],
+                        "next": "FINISH",
+                    },
                 )
-            logger.info(f"Supervisor routing to FINISH (raw: {goto!r}), generating reply")
+            logger.info(
+                f"Supervisor routing to FINISH (raw: {goto!r}), generating reply"
+            )
             return await _emit_final_reply(state_messages)
 
         logger.info(f"Supervisor routing to: {goto}")

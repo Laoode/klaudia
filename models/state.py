@@ -22,8 +22,8 @@ class KlaudiaState(MessagesState):
     # Structured context slices (formatted strings), populated by the
     # orchestrator and threaded into the graph via process/stream_conversation.
     sheets_context: str = ""  # AVAILABLE SHEETS block (index -> title)
-    files_context: str = ""   # SESSION FILES block (sql_agent only)
-    date_context: str = ""    # CURRENT DATE/TIME line (write_agent needs it)
+    files_context: str = ""  # SESSION FILES block (sql_agent only)
+    date_context: str = ""  # CURRENT DATE/TIME line (write_agent needs it)
 
     # Deterministic compound sequencer: when a single user turn asks to CREATE a
     # sheet AND WRITE into it, the team supervisor forces sheet_agent first and

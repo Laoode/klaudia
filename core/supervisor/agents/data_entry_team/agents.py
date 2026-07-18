@@ -58,7 +58,15 @@ _SHEET_WORDS = ("sheet", "tab")
 # Data-insertion verbs only (excludes ambiguous "tambah", which also means
 # "tambah sheet" = create, not write).
 _WRITE_VERBS = (
-    "masuk", "input", "catat", "isi", "record", "insert", "simpan", "entri", "entry",
+    "masuk",
+    "input",
+    "catat",
+    "isi",
+    "record",
+    "insert",
+    "simpan",
+    "entri",
+    "entry",
 )
 
 
@@ -66,7 +74,9 @@ def _has_create_sheet_intent(text: str) -> bool:
     t = text.lower()
     if any(p in t for p in _CREATE_SHEET_PHRASES):
         return True
-    return any(v in t for v in _CREATE_SHEET_VERBS) and any(w in t for w in _SHEET_WORDS)
+    return any(v in t for v in _CREATE_SHEET_VERBS) and any(
+        w in t for w in _SHEET_WORDS
+    )
 
 
 def _has_write_intent(text: str) -> bool:
@@ -243,12 +253,16 @@ def make_data_entry_team(
         )
         messages = [{"role": "system", "content": classifier_prompt}] + convo
         # routing_llm is pre-bound with minimal thinking — classification task only.
-        response = await ainvoke_route(with_structured(routing_llm, TeamRouter), messages)
+        response = await ainvoke_route(
+            with_structured(routing_llm, TeamRouter), messages
+        )
         if response is None:
             # No parseable route (malformed tool-call JSON) even after retry.
             # End the sub-graph cleanly so the parent can summarize, rather than
             # crashing on response["next"].
-            logger.warning("Team supervisor: no valid structured route; FINISH fallback")
+            logger.warning(
+                "Team supervisor: no valid structured route; FINISH fallback"
+            )
             return Command(goto=END, update={"next": "FINISH"})
         goto = _normalize_route(response["next"])
         if goto == "FINISH":
